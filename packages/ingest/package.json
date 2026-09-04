@@ -1,0 +1,25 @@
+{
+  "name": "@workspace/ingest",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "probe": "node --env-file-if-exists=../../.env.local src/cli.ts probe",
+    "extract": "node --env-file-if-exists=../../.env.local src/cli.ts extract",
+    "load": "node --env-file-if-exists=../../.env.local src/cli.ts load",
+    "all": "node --env-file-if-exists=../../.env.local src/cli.ts all",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.123.0",
+    "@napi-rs/canvas": "^0.1.85",
+    "@supabase/supabase-js": "^2.97.0",
+    "@workspace/normalize": "workspace:*",
+    "pdfjs-dist": "^4.10.38"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@workspace/typescript-config": "workspace:*",
+    "typescript": "^5"
+  }
+}

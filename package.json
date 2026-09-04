@@ -7,7 +7,9 @@
     "dev": "turbo dev",
     "lint": "turbo lint",
     "format": "turbo format",
-    "typecheck": "turbo typecheck"
+    "typecheck": "turbo typecheck",
+    "ingest": "node --env-file-if-exists=.env.local packages/ingest/src/cli.ts",
+    "demo": "node packages/normalize/src/demo.ts"
   },
   "devDependencies": {
     "@workspace/eslint-config": "workspace:*",

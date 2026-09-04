@@ -43,3 +43,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# voter roll source data & extraction output (personal data - never commit)
+/data/**
+!/data/pdfs/.gitkeep
