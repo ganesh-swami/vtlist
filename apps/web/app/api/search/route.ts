@@ -9,12 +9,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { nameForms, queryForms } from "@workspace/normalize";
+import type { Database } from "@/utils/supabase/types";
 
 // Built on first request, not at module load, so a missing env var surfaces as
 // a 500 with a readable message instead of failing the whole build.
-let client: ReturnType<typeof createClient> | null = null;
+let client: ReturnType<typeof createClient<Database>> | null = null;
 function supabase() {
-  client ??= createClient(
+  client ??= createClient<Database>(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
     { auth: { persistSession: false } },

@@ -29,7 +29,12 @@ export interface Elector {
   listType: "main" | "supplement";
   isDeleted: boolean;
   deletionReason: "death" | "shifted" | "repetition" | null;
+  /** Individual cropped photo — only when photos were generated. */
   photoPath: string | null;
+  /** Scan of the whole printed page this elector sits on. Always set: one
+   * image per page instead of one per person is ~30x less work to produce and
+   * still lets a reader zoom to the box and check the row against the roll. */
+  pageImage: string | null;
   pageNo: number;
   boxNo: number;
   /** Everything both passes saw, so any row can be audited without the PDF. */

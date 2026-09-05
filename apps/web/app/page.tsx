@@ -9,27 +9,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 
-interface Result {
-  id: string;
-  name_hi: string | null;
-  name_latin: string | null;
-  relation_type: "father" | "husband" | "mother" | "other" | null;
-  relation_name_hi: string | null;
-  relation_name_latin: string | null;
-  house_no: string | null;
-  age: number | null;
-  gender: "M" | "F" | "O" | null;
-  epic_no: string | null;
-  ward: string;
-  part_no: string;
-  serial_no: number;
-  section_label: string | null;
-  is_deleted: boolean;
-  photo_path: string | null;
-  page_no: number;
-  score: number;
-  matched_on: string;
-}
+import type { VoterResult as Result } from "@/utils/supabase/types";
+
 
 const RELATION_LABEL: Record<string, string> = {
   father: "पिता",

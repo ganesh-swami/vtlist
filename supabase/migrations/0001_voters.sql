@@ -208,10 +208,6 @@ as $fn$
   offset greatest(coalesce(off, 0), 0);
 $fn$;
 
--- pg_trgm's `%` operator defaults to a 0.3 similarity floor; 0.25 recalls more
--- of the long Hindi compound names without pulling in obvious noise.
-alter database postgres set pg_trgm.similarity_threshold = 0.25;
-
 -- --------------------------------------------------------------------- access
 
 alter table public.voters      enable row level security;

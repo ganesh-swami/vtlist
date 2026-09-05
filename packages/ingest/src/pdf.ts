@@ -12,8 +12,9 @@
  *
  *   serial number, EPIC number, deletion marker   1 / IXQ0584201 / "E"
  *   age                                           digits
- *   the field labels                              fixed garbled strings
- *   gender and relation type                      fixed garbled strings
+ *   the field labels                              stable garbled words
+ *   gender and relation type                      stable garbled words
+ *   house number, when it is printed as digits    digits
  *   EXACT COORDINATES of every box on the page    <- the important one
  *
  * So this module builds the page's box grid from the text layer, and the crops
@@ -44,33 +45,34 @@ try {
  * so a token only has to be a stable substring, not an exact string.
  */
 export const TOKENS = {
-  /** नाम: — one per elector box, and the anchor the whole grid is built on. */
-  nameLabel: ["नरम:"], // नरम:
-  /** पिता का नाम: */
-  father: ["नपतर कर नरम"], // नपतर कर नरम
-  /** पति का नाम: */
-  husband: ["पनत कर नरम"], // पनत कर नरम
-  /** माता का नाम: */
-  mother: ["मरतर कर नरम"], // मरतर कर नरम
-  /** अन्य का नाम: */
-  other: ["अनज कर नरम"], // अनज कर नरम
+  /** पिता — the label word, whole. pdfjs emits each word as its own item. */
+  father: ["नपतर"], // नपतर
+  /** पति */
+  husband: ["पनत"], // पनत
+  /** माता */
+  mother: ["मरतर"], // मरतर
+  /** अन्य */
+  other: ["अनज"], // अनज
   /** पुरुष */
   male: ["पचरष"], // पचरष
-  /** तृतीय लिंग — checked before स्त्री, because both are short. */
-  third: ["ततलतज", "तततलज"], // ततलतज / तततलज
+  /** तृतीय — checked before स्त्री, because both are short. */
+  third: ["ततलतज", "तततलज", "ततबतज"], // ततलतज / तततलज
   /** स्त्री — ी differs between the two fonts, so both spellings are listed. */
   female: ["सल", "सब"], // सल / सब
-  /** आयु: */
+  /** आयु */
   ageLabel: ["आजच"], // आजच
+  /** मकान */
+  houseLabel: ["मकरन"], // मकरन
 } as const;
 
-const has = (s: string, list: readonly string[]) => list.some((t) => s.includes(t));
+const is = (s: string, list: readonly string[]) => list.includes(s.trim());
 
-/** Serial + EPIC on the box's header line, e.g. " 1 JGR2375541", "E 57 IXQ0300764". */
-const SERIAL_EPIC =
-  /^\s*([ESR])?\s*(\d{1,5})\s+([A-Z]{3}\d{7}|RJ\/\d{2}\/\d{3}\/\d{6}|[A-Z]{2,4}[\d/]{6,20})\s*$/;
-/** Supplement additions have a serial but no EPIC yet. */
-const SERIAL_ONLY = /^\s*([ESR])?\s*(\d{1,5})\s*$/;
+/** EPIC numbers, both the modern and the older RJ/xx/xxx/xxxxxx form. */
+const EPIC = /^(?:[A-Z]{3}\d{7}|RJ\/\d{2}\/\d{3}\/\d{6})$/;
+/** A serial number, as printed in the roll's dedicated serial font. */
+const SERIAL = /^\d{1,5}$/;
+/** The deletion marker printed immediately left of a struck-off serial. */
+const MARK = /^[ESR]$/;
 
 const DELETION_REASON: Record<string, "death" | "shifted" | "repetition"> = {
   E: "death",
@@ -86,14 +88,28 @@ const DELETION_REASON: Record<string, "death" | "shifted" | "repetition"> = {
  * overlay without touching code.
  */
 export const PHOTO = {
-  left: num("PHOTO_LEFT", 0.72),
-  top: num("PHOTO_TOP", 0.06),
+  left: num("PHOTO_LEFT", 0.665),
+  top: num("PHOTO_TOP", 0.05),
   right: num("PHOTO_RIGHT", 0.985),
-  bottom: num("PHOTO_BOTTOM", 0.97),
+  bottom: num("PHOTO_BOTTOM", 0.98),
 };
-/** How far above the नाम label the box's top border sits, in PDF points. */
-const HEADER_H = num("BOX_HEADER_H", 15);
-const LEFT_PAD = num("BOX_LEFT_PAD", 7);
+/**
+ * Offset from the serial number's baseline origin to the box's top-left corner,
+ * in PDF points. Measured on the real roll: the serial sits at x=49,y=160 in a
+ * box whose corner is at x=34,y=147.
+ */
+const SERIAL_OFF_X = num("SERIAL_OFF_X", 15);
+/**
+ * Extra slack on the LEFT when collecting a box's text, over and above the
+ * printed box rectangle. The serial sits ~13pt right of the box edge on the
+ * main pages but ~22pt on the supplement pages, so a fixed rectangle clips the
+ * first word of each label line there ('पिता', 'मकान', 'आयु') and the row comes
+ * out with no relation type or gender. Widening only the text window fixes that
+ * without moving the photo crop: the strip this reaches into is the previous
+ * column's photo, which contains no text at all.
+ */
+const TEXT_PAD_LEFT = num("TEXT_PAD_LEFT", 14);
+const SERIAL_OFF_Y = num("SERIAL_OFF_Y", 13);
 
 function num(key: string, fallback: number): number {
   const v = process.env[key];
@@ -116,6 +132,8 @@ export interface RawBox {
   age: number | null;
   gender: "M" | "F" | "O" | null;
   relationType: "father" | "husband" | "mother" | "other" | null;
+  /** Digits-only house number from the text layer; Hindi ones come from the scan. */
+  houseNo: string | null;
   pageNo: number;
   boxNo: number;
   /** Box bounds in top-down page points, at scale 1. */
@@ -139,6 +157,8 @@ interface Item {
   top: number;
   width: number;
   height: number;
+  /** pdfjs font id — the serial-number anchor is identified by this. */
+  font: string;
 }
 
 /** Cluster sorted numbers, starting a new group whenever the gap exceeds `gap`. */
@@ -173,11 +193,19 @@ export async function openPdf(path: string) {
 }
 
 /**
- * Build the elector-box grid for one page from text positions.
+ * Build the elector-box grid for one page.
  *
- * The grid is derived, not assumed: section headings push rows down mid-page,
- * so column and row positions are measured from the नाम labels themselves and
- * the box size comes from the median spacing between them.
+ * The anchor is the serial number. The roll typesets serial numbers in a font
+ * of their own — nothing else on the page uses it — so "every item in the
+ * serial font that is a bare integer" is exactly one item per elector box, with
+ * no false positives from ages, house numbers or page numbers. The column and
+ * row spacing then falls out of those anchors, which matters because section
+ * headings push rows down mid-page and the grid is not uniform.
+ *
+ * Word-level parsing is deliberate too: pdfjs emits each word as its own item,
+ * so labels are matched as whole words ("नपतर" = पिता) rather than as
+ * substrings of a joined line. The font's ToUnicode map is lossy for names, but
+ * it is perfectly stable for these fixed label words.
  */
 export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
   const page = await doc.getPage(pageNo);
@@ -187,117 +215,151 @@ export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
   const items: Item[] = content.items
     .filter((i: any) => typeof i.str === "string" && i.str.trim() !== "")
     .map((i: any) => ({
-      str: i.str,
+      str: i.str.trim(),
       x: i.transform[4],
       top: viewport.height - i.transform[5],
       width: i.width ?? 0,
       height: i.height ?? 10,
+      font: i.fontName ?? "",
     }));
 
-  const anchors = items.filter((i) => has(i.str, TOKENS.nameLabel));
-  if (anchors.length === 0) {
-    return { pageNo, width: viewport.width, height: viewport.height, boxes: [], headings: [] };
+  const empty = { pageNo, width: viewport.width, height: viewport.height, boxes: [], headings: [] };
+
+  // Which font is the serial font on this page?
+  //
+  // "Most numeric items" is not enough — house numbers, ages and EPIC digits all
+  // share one font and vastly outnumber the serials. What singles the serials
+  // out is that they *count*: read in box order they go 1, 2, 3, … with no gaps.
+  // Ages and house numbers never do. Scoring on that also makes the header,
+  // summary and deletion-appendix pages fall out on their own, which is right —
+  // they carry no new electors, and the deletion marks they repeat are already
+  // printed beside the serial in the main list.
+  const numeric = new Map<string, Item[]>();
+  for (const i of items) {
+    if (SERIAL.test(i.str)) (numeric.get(i.font) ?? numeric.set(i.font, []).get(i.font)!).push(i);
   }
 
-  // Columns and rows, measured rather than assumed.
+  let serialFont = "";
+  let best = 0;
+  for (const [font, group] of numeric) {
+    if (group.length < 3) continue;
+    const run = [...group].sort((a, b) => a.top - b.top || a.x - b.x).map((i) => Number(i.str));
+    const steps = run.slice(1).filter((v, k) => v - run[k]! === 1).length;
+    const consecutive = steps / (run.length - 1);
+    if (consecutive >= 0.8 && group.length > best) {
+      serialFont = font;
+      best = group.length;
+    }
+  }
+  if (!serialFont) return empty;
+
+  const anchors = numeric
+    .get(serialFont)!
+    .sort((a, b) => a.top - b.top || a.x - b.x);
+
   const colXs = cluster(anchors.map((a) => a.x), 40);
   const rowTops = cluster(anchors.map((a) => a.top), 12);
-  const colStep = colXs.length > 1 ? median(diffs(colXs)) : viewport.width * 0.31;
-  const rowStep = rowTops.length > 1 ? median(diffs(rowTops)) : 52;
+  const colStep = colXs.length > 1 ? median(diffs(colXs)) : viewport.width * 0.29;
+  const rowStep = rowTops.length > 1 ? median(diffs(rowTops)) : 72.5;
 
   const boxes: RawBox[] = [];
   const used = new Set<Item>();
 
-  // Reading order: row by row, left to right — which is also serial order.
-  const ordered = [...anchors].sort((a, b) => a.top - b.top || a.x - b.x);
-
-  for (const [idx, anchor] of ordered.entries()) {
+  for (const [idx, anchor] of anchors.entries()) {
     const rect: Rect = {
-      left: anchor.x - LEFT_PAD,
-      top: anchor.top - HEADER_H,
+      left: anchor.x - SERIAL_OFF_X,
+      top: anchor.top - SERIAL_OFF_Y,
       width: colStep,
       height: rowStep,
     };
     const inside = items.filter(
       (i) =>
-        i.x >= rect.left - 2 &&
-        i.x < rect.left + rect.width &&
+        i.x >= rect.left - TEXT_PAD_LEFT &&
+        i.x < rect.left + rect.width - 2 &&
         i.top >= rect.top - 2 &&
-        i.top < rect.top + rect.height,
+        i.top < rect.top + rect.height - 2,
     );
     inside.forEach((i) => used.add(i));
 
     const box: RawBox = {
-      serialNo: null,
+      serialNo: Number(anchor.str),
       epicNo: null,
       deletionMark: null,
       age: null,
       gender: null,
       relationType: null,
+      houseNo: null,
       pageNo,
       boxNo: idx + 1,
       rect,
-      fragments: inside.map((i) => i.str),
+      fragments: inside.sort((a, b) => a.top - b.top || a.x - b.x).map((i) => i.str),
     };
 
-    for (const item of inside) {
-      const s = item.str;
+    // Group the box's items into printed lines, so "the number on the आयु line"
+    // is unambiguous even though ages, house numbers and serials all look alike.
+    const lines = groupLines(inside);
 
-      const se = SERIAL_EPIC.exec(s);
-      if (se && box.serialNo === null) {
-        box.deletionMark = (se[1] as "E" | "S" | "R" | undefined) ?? null;
-        box.serialNo = Number(se[2]);
-        box.epicNo = se[3] ?? null;
-        continue;
-      }
+    for (const line of lines) {
+      const words = line.map((i) => i.str);
 
-      // Age and gender share a fragment: "आजच: 55 पचरष".
-      if (has(s, TOKENS.ageLabel) || has(s, TOKENS.male) || has(s, TOKENS.female)) {
-        const age = /(\d{1,3})/.exec(s);
-        if (age && box.age === null) box.age = Number(age[1]);
-        if (box.gender === null) {
-          if (has(s, TOKENS.male)) box.gender = "M";
-          else if (has(s, TOKENS.third)) box.gender = "O";
-          else if (has(s, TOKENS.female)) box.gender = "F";
+      for (const item of line) {
+        if (!box.epicNo && EPIC.test(item.str)) box.epicNo = item.str;
+        if (
+          !box.deletionMark &&
+          item.font === serialFont &&
+          MARK.test(item.str) &&
+          item.x < anchor.x
+        ) {
+          box.deletionMark = item.str as "E" | "S" | "R";
         }
-        continue;
       }
 
-      if (box.relationType === null) {
-        if (has(s, TOKENS.father)) box.relationType = "father";
-        else if (has(s, TOKENS.husband)) box.relationType = "husband";
-        else if (has(s, TOKENS.mother)) box.relationType = "mother";
-        else if (has(s, TOKENS.other)) box.relationType = "other";
+      if (words.some((w) => is(w, TOKENS.ageLabel))) {
+        const age = line.find((i) => /^\d{1,3}$/.test(i.str) && i.font !== serialFont);
+        if (age) box.age = Number(age.str);
+        if (words.some((w) => is(w, TOKENS.male))) box.gender = "M";
+        else if (words.some((w) => is(w, TOKENS.third))) box.gender = "O";
+        else if (words.some((w) => is(w, TOKENS.female))) box.gender = "F";
       }
-    }
 
-    // Supplement pages print a bare serial with no EPIC; only accept such a
-    // fragment once the EPIC form has been ruled out, so ages and house numbers
-    // (which are also bare digits) cannot be mistaken for it.
-    if (box.serialNo === null) {
-      const topOfBox = rect.top + HEADER_H * 0.9;
-      for (const item of inside) {
-        if (item.top > topOfBox) continue;
-        const so = SERIAL_ONLY.exec(item.str);
-        if (so) {
-          box.deletionMark = (so[1] as "E" | "S" | "R" | undefined) ?? null;
-          box.serialNo = Number(so[2]);
-          break;
-        }
+      if (!box.relationType) {
+        if (words.some((w) => is(w, TOKENS.father))) box.relationType = "father";
+        else if (words.some((w) => is(w, TOKENS.husband))) box.relationType = "husband";
+        else if (words.some((w) => is(w, TOKENS.mother))) box.relationType = "mother";
+        else if (words.some((w) => is(w, TOKENS.other))) box.relationType = "other";
+      }
+
+      // House number: whatever follows the मकान संख्या label on its line. Often
+      // digits, sometimes Hindi words — the Hindi is garbled here and gets
+      // replaced by the transcription, but the digit form is already correct.
+      if (!box.houseNo && words.some((w) => is(w, TOKENS.houseLabel))) {
+        const after = line.filter((i) => /^[\d\-\s.,/]+$/.test(i.str) && i.str.trim() !== "");
+        if (after.length) box.houseNo = after.map((i) => i.str).join("").trim() || null;
       }
     }
 
     boxes.push(box);
   }
 
-  // Anything left over above the first box is a section heading (street name).
   const firstTop = Math.min(...boxes.map((b) => b.rect.top));
   const headings = items
-    .filter((i) => !used.has(i) && i.top > 90 && i.top < firstTop)
-    .map((i) => i.str.trim())
+    .filter((i) => !used.has(i) && i.top > 130 && i.top < firstTop)
+    .map((i) => i.str)
     .filter(Boolean);
 
   return { pageNo, width: viewport.width, height: viewport.height, boxes, headings };
+}
+
+/** Split a box's items into printed lines (same baseline within 3pt). */
+function groupLines(items: Item[]): Item[][] {
+  const sorted = [...items].sort((a, b) => a.top - b.top || a.x - b.x);
+  const lines: Item[][] = [];
+  for (const i of sorted) {
+    const last = lines.at(-1);
+    if (last && Math.abs(i.top - last[0]!.top) <= 3) last.push(i);
+    else lines.push([i]);
+  }
+  return lines.map((l) => l.sort((a, b) => a.x - b.x));
 }
 
 function diffs(xs: number[]): number[] {
@@ -383,4 +445,91 @@ export async function debugOverlay(pageCanvas: any, boxes: RawBox[], scale: numb
     ctx.fillText(String(b.serialNo ?? "?"), b.rect.left * scale + 4, b.rect.top * scale + 16);
   }
   return await out.encode("png");
+}
+
+/**
+ * Group a page's boxes into the strips that get sent for transcription.
+ *
+ * Claude downscales any image so neither side exceeds 1568px. A whole A4 page
+ * therefore arrives at ~2 px per point, which leaves the 7pt Devanagari names
+ * about 13px tall — legible, but thin enough that a matra or an anusvara can be
+ * lost. Cutting the page into short vertical runs within one column keeps each
+ * strip under the cap at roughly double that scale, so the names arrive at a
+ * size where the marks are unambiguous.
+ *
+ * Grouping is column-major so every group is a contiguous strip, never a
+ * scattered set of boxes.
+ */
+export function chunkBoxes(boxes: RawBox[], perChunk = 5): RawBox[][] {
+  const columns = new Map<number, RawBox[]>();
+  for (const b of boxes) {
+    // Round to the nearest 20pt so slight per-row jitter stays in one column.
+    const key = Math.round(b.rect.left / 20);
+    (columns.get(key) ?? columns.set(key, []).get(key)!).push(b);
+  }
+  const chunks: RawBox[][] = [];
+  for (const key of [...columns.keys()].sort((a, b) => a - b)) {
+    const column = columns.get(key)!.sort((a, b) => a.rect.top - b.rect.top);
+    for (let i = 0; i < column.length; i += perChunk) {
+      chunks.push(column.slice(i, i + perChunk));
+    }
+  }
+  return chunks;
+}
+
+/** Bounding rectangle of a group of boxes, with a little breathing room. */
+export function boundsOf(boxes: RawBox[], pad = 3): Rect {
+  const left = Math.min(...boxes.map((b) => b.rect.left)) - pad;
+  const top = Math.min(...boxes.map((b) => b.rect.top)) - pad;
+  const right = Math.max(...boxes.map((b) => b.rect.left + b.rect.width)) + pad;
+  const bottom = Math.max(...boxes.map((b) => b.rect.top + b.rect.height)) + pad;
+  return { left, top, width: right - left, height: bottom - top };
+}
+
+/**
+ * Cut an arbitrary region out of the rendered page, downscaling only if it
+ * would otherwise exceed `maxEdge` — which is exactly the cap the API applies,
+ * so doing it here saves the upload rather than changing what Claude sees.
+ */
+export async function cropRegion(
+  pageCanvas: any,
+  rect: Rect,
+  scale: number,
+  maxEdge = 1560,
+): Promise<Buffer> {
+  const sx = Math.max(0, Math.round(rect.left * scale));
+  const sy = Math.max(0, Math.round(rect.top * scale));
+  const sw = Math.min(Math.round(rect.width * scale), pageCanvas.width - sx);
+  const sh = Math.min(Math.round(rect.height * scale), pageCanvas.height - sy);
+
+  const shrink = Math.min(1, maxEdge / Math.max(sw, sh));
+  const dw = Math.max(1, Math.round(sw * shrink));
+  const dh = Math.max(1, Math.round(sh * shrink));
+
+  const out = createCanvas(dw, dh);
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, dw, dh);
+  ctx.drawImage(pageCanvas, sx, sy, sw, sh, 0, 0, dw, dh);
+  return await out.encode("png");
+}
+
+/** Same crop as `cropRegion`, encoded as JPEG for the website. */
+export async function cropToJpeg(
+  pageCanvas: any,
+  rect: Rect,
+  scale: number,
+  quality = 84,
+): Promise<Buffer> {
+  const sx = Math.max(0, Math.round(rect.left * scale));
+  const sy = Math.max(0, Math.round(rect.top * scale));
+  const sw = Math.min(Math.round(rect.width * scale), pageCanvas.width - sx);
+  const sh = Math.min(Math.round(rect.height * scale), pageCanvas.height - sy);
+
+  const out = createCanvas(Math.max(sw, 1), Math.max(sh, 1));
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(pageCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return await out.encode("jpeg", quality);
 }

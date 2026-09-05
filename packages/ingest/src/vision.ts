@@ -107,8 +107,9 @@ export async function readNames(
           {
             type: "text",
             text:
-              `This page has ${boxes.length} elector boxes, in reading order ` +
-              `(left to right, top to bottom), with these serial numbers: ${expected}.\n` +
+              `This strip is one column from a roll page and holds ${boxes.length} ` +
+              `elector boxes stacked top to bottom, with these serial numbers ` +
+              `in that order: ${expected}.\n` +
               `Return exactly ${boxes.length} objects, one per box, in that same order.` +
               (attempt > 1
                 ? `\n\nThe previous attempt returned the wrong serials. Read the header of each box carefully.`

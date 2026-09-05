@@ -1,42 +1,79 @@
 #!/usr/bin/env node
 /**
- * Voter-roll ingest CLI.
+ * Voter-roll ingest CLI. Works on one PDF at a time.
  *
- *   pnpm ingest probe            look at one PDF and write a debug overlay
- *   pnpm ingest extract          PDFs -> data/extracted/*.json + photos
- *   pnpm ingest load             data/extracted/*.json -> Supabase
- *   pnpm ingest all              extract then load, for every PDF
+ *   pnpm ingest probe   <pdf>   check box detection, write a debug overlay
+ *   pnpm ingest sheets  <pdf>   write one legible page image per page, for
+ *                               transcribing the names by eye
+ *   pnpm ingest zoom    <pdf> <serial...>   blow up single boxes to re-check
+ *                               a name that was hard to read
+ *   pnpm ingest csv     <pdf>   structure + names -> data/csv/<part>.csv
+ *                               (add --no-photos to skip cropping for now)
+ *   pnpm ingest migrate         apply supabase/migrations/*.sql (optional)
+ *   pnpm ingest load            data/extracted/*.json -> Supabase (optional)
  *
- * Add --no-vision to run the structural pass alone (no API calls, no names) —
- * useful for checking box detection before spending anything.
+ * Names come from `data/names/<part>.json`, a plain map of
+ *   { "<serial>": ["<नाम>", "<पिता/पति का नाम>"] }
+ * which is produced either by transcribing the sheets or, with --vision, by
+ * calling the API. Everything else on the row is read from the PDF itself.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createCanvas, loadImage } from "@napi-rs/canvas";
 
-import { cropPhoto, debugOverlay, deletionReason, openPdf, readPage, renderPage } from "./pdf.ts";
+import {
+  boundsOf,
+  chunkBoxes,
+  cropPhoto,
+  cropRegion,
+  cropToJpeg,
+  debugOverlay,
+  deletionReason,
+  openPdf,
+  readPage,
+  renderPage,
+} from "./pdf.ts";
 import type { PageResult, RawBox } from "./pdf.ts";
 import { costSoFar, readNames, usage, type VisionRecord } from "./vision.ts";
+import { toCsv } from "./csv.ts";
 import { loadPart } from "./db.ts";
+import { migrate } from "./migrate.ts";
 import type { Elector, ExtractedPart, PartMeta } from "./types.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../../..");
 const PDF_DIR = path.join(ROOT, "data", "pdfs");
 const OUT_DIR = path.join(ROOT, "data", "extracted");
+const CSV_DIR = path.join(ROOT, "data", "csv");
+const NAMES_DIR = path.join(ROOT, "data", "names");
+const SHEET_DIR = path.join(ROOT, "data", "sheets");
 const PHOTO_DIR = path.join(ROOT, "apps", "web", "public", "photos");
+const PAGE_DIR = path.join(ROOT, "apps", "web", "public", "pages");
 const DEBUG_DIR = path.join(ROOT, "data", "debug");
 
-/** 200 dpi: photos land near their printed resolution and pages stay readable. */
-const SCALE = Number(process.env.RENDER_SCALE ?? 2.78);
-const VISION_CONCURRENCY = Number(process.env.VISION_CONCURRENCY ?? 4);
+/** ~290 dpi. Photos are cut from this, so it wants to be generous. */
+const SCALE = Number(process.env.RENDER_SCALE ?? 4);
+
+/**
+ * Scale for the transcription sheets. 2.2 puts a full 3x9 page grid at roughly
+ * 1150x1450 px, which is where the printed Devanagari — matras, anusvaras and
+ * all — is unambiguous to read. Verified against the real roll before use.
+ */
+const SHEET_SCALE = Number(process.env.SHEET_SCALE ?? 2.2);
+const PAGE_CONCURRENCY = Number(process.env.PAGE_CONCURRENCY ?? 4);
+const BOXES_PER_STRIP = Number(process.env.BOXES_PER_STRIP ?? 5);
 
 const args = process.argv.slice(2);
-const command = args[0] ?? "all";
+const command = args[0] ?? "csv";
 const flags = new Set(args.filter((a) => a.startsWith("--")));
 const positional = args.slice(1).filter((a) => !a.startsWith("--"));
-const useVision = !flags.has("--no-vision");
+const useVision = flags.has("--vision");
+// Photos are the slow part (every page has to be rasterised at 4x). Names are
+// the deliverable, so cropping can be deferred without blocking anything: the
+// filenames are pure functions of the id, so linking them later needs no rerun.
+const usePhotos = !flags.has("--no-photos");
 
 /**
  * Ward and part come from the filename the SEC portal hands out, e.g.
@@ -50,21 +87,25 @@ function identify(file: string): { ward: string; partNo: string } {
   if (!ward || !part) {
     throw new Error(
       `Cannot read ward/part from "${base}".\n` +
-        `Either keep the portal's filename, or rename it like ` +
-        `"Ward No-001-Part No-003.pdf".`,
+        `Keep the portal's filename, or rename it like "Ward No-001-Part No-003.pdf".`,
     );
   }
   return { ward, partNo: part };
 }
 
-async function listPdfs(): Promise<string[]> {
-  if (positional.length) return positional.map((p) => path.resolve(p));
-  try {
-    const entries = await readdir(PDF_DIR);
-    return entries.filter((f) => f.toLowerCase().endsWith(".pdf")).sort().map((f) => path.join(PDF_DIR, f));
-  } catch {
-    return [];
-  }
+/** One PDF per run — the first positional argument, or the only file present. */
+async function pickPdf(): Promise<string> {
+  if (positional.length) return path.resolve(positional[0]!);
+  const entries = (await readdir(PDF_DIR).catch(() => [])).filter((f) =>
+    f.toLowerCase().endsWith(".pdf"),
+  );
+  if (entries.length === 1) return path.join(PDF_DIR, entries[0]!);
+  throw new Error(
+    entries.length === 0
+      ? `No PDFs in ${path.relative(ROOT, PDF_DIR)}/.`
+      : `${entries.length} PDFs present — name the one to process:\n` +
+        entries.map((e) => `  pnpm ingest ${command} "data/pdfs/${e}"`).join("\n"),
+  );
 }
 
 /** Run `worker` over `items` with at most `limit` in flight. */
@@ -83,7 +124,85 @@ async function pool<T, R>(items: T[], limit: number, worker: (item: T, i: number
   return results;
 }
 
-// ------------------------------------------------------------------- extract
+/** Pages that actually hold electors — headers, maps and summaries have none. */
+async function contentPages(doc: any): Promise<PageResult[]> {
+  const pages: PageResult[] = [];
+  for (let p = 1; p <= doc.numPages; p++) pages.push(await readPage(doc, p));
+  return pages.filter((pg) => pg.boxes.length > 0);
+}
+
+// -------------------------------------------------------------------- sheets
+
+/**
+ * Write one image per page for transcription.
+ *
+ * The page is cropped to the elector grid — headers, ward descriptions and the
+ * locality map carry no electors and only cost legibility — and rendered at the
+ * scale validated above. The accompanying index says which serials are on each
+ * sheet, so a transcription can never drift out of alignment.
+ */
+async function cmdSheets() {
+  const file = await pickPdf();
+  const { ward, partNo } = identify(file);
+  const partId = `${ward}_${partNo}`;
+  const dir = path.join(SHEET_DIR, partId);
+  await mkdir(dir, { recursive: true });
+
+  const doc = await openPdf(file);
+  const pages = await contentPages(doc);
+  console.log(`${path.basename(file)} → ward ${ward}, part ${partNo}`);
+  console.log(`  ${pages.length} pages with electors (of ${doc.numPages})`);
+
+  await mkdir(PAGE_DIR, { recursive: true });
+
+  const index: Record<string, number[]> = {};
+  await pool(pages, PAGE_CONCURRENCY, async (pg) => {
+    const canvas = await renderPage(doc, pg.pageNo, SHEET_SCALE);
+    const rect = boundsOf(pg.boxes, 4);
+    const name = `p${String(pg.pageNo).padStart(3, "0")}.png`;
+
+    // PNG for transcription (lossless, nothing to second-guess) …
+    await writeFile(path.join(dir, name), await cropRegion(canvas, rect, SHEET_SCALE, 2400));
+
+    // … and a JPEG of the same crop for the website, which every row on this
+    // page points at. One image per page rather than one per elector: ~30x
+    // cheaper to produce, and a reader can still zoom to their own क्रम संख्या
+    // and check the row against what the roll actually prints.
+    const jpeg = await cropToJpeg(canvas, rect, SHEET_SCALE);
+    await writeFile(path.join(PAGE_DIR, `${partId}_${name.replace(".png", ".jpg")}`), jpeg);
+
+    index[name] = pg.boxes.map((b) => b.serialNo!).filter((s) => s !== null);
+  });
+
+  const ordered = Object.fromEntries(Object.entries(index).sort(([a], [b]) => a.localeCompare(b)));
+  await writeFile(path.join(dir, "index.json"), JSON.stringify(ordered, null, 2));
+
+  const total = Object.values(ordered).reduce((n, s) => n + s.length, 0);
+  console.log(`  → ${path.relative(ROOT, dir)}/  (${pages.length} sheets, ${total} electors)`);
+  console.log(`  index.json lists the serials on each sheet.`);
+}
+
+// ---------------------------------------------------------------- extraction
+
+type NameMap = Record<string, [string | null, string | null]>;
+/**
+ * Section headings (street / locality names) are printed in the same broken
+ * font as the elector names, so the text layer's version of them is garbage and
+ * must never reach the CSV. They are transcribed alongside the names, under a
+ * _sections key. It maps the FIRST SERIAL of a section to its heading, because
+ * a new heading can start partway down a page (part 3 page 4 starts one at
+ * serial 31); every elector from there on belongs to it until the next heading.
+ */
+type SectionMap = Record<string, string>;
+
+async function loadNameMap(partId: string): Promise<NameMap> {
+  const file = path.join(NAMES_DIR, `${partId}.json`);
+  try {
+    return JSON.parse(await readFile(file, "utf8")) as NameMap;
+  } catch {
+    return {};
+  }
+}
 
 async function extractOne(file: string): Promise<ExtractedPart> {
   const { ward, partNo } = identify(file);
@@ -93,77 +212,75 @@ async function extractOne(file: string): Promise<ExtractedPart> {
 
   console.log(`\n${path.basename(file)}  →  ward ${ward}, part ${partNo}`);
   const doc = await openPdf(file);
-  console.log(`  ${doc.numPages} pages`);
+  const pages = await contentPages(doc);
+  const boxCount = pages.reduce((n, pg) => n + pg.boxes.length, 0);
+  console.log(`  ${doc.numPages} pages, ${pages.length} with electors, ${boxCount} boxes`);
+  if (!boxCount) {
+    throw new Error("No elector boxes found — run `pnpm ingest probe` to see why.");
+  }
+
+  const raw = await loadNameMap(partId);
+  const sections = (raw as any)._sections as SectionMap | undefined;
+  const typed: NameMap = Object.fromEntries(
+    Object.entries(raw).filter(([k]) => /^\d+$/.test(k)),
+  );
+  if (Object.keys(typed).length) {
+    console.log(`  ${Object.keys(typed).length} transcribed names from data/names/${partId}.json`);
+  } else if (!useVision) {
+    console.log(`  no data/names/${partId}.json yet — rows will carry no names`);
+  }
 
   await mkdir(PHOTO_DIR, { recursive: true });
   await mkdir(DEBUG_DIR, { recursive: true });
 
-  // Pass 1 — structure from the text layer.
-  const pages: PageResult[] = [];
-  for (let p = 1; p <= doc.numPages; p++) {
-    pages.push(await readPage(doc, p));
-  }
-  const boxCount = pages.reduce((n, pg) => n + pg.boxes.length, 0);
-  const withSerial = pages.reduce((n, pg) => n + pg.boxes.filter((b) => b.serialNo !== null).length, 0);
-  console.log(`  ${boxCount} elector boxes detected, ${withSerial} with a serial number`);
-
-  if (boxCount === 0) {
-    throw new Error(
-      "No elector boxes found. The नाम label token in pdf.ts probably does not " +
-        "match this file's font — run `pnpm ingest probe` to see the raw fragments.",
-    );
-  }
-
-  // Pass 2 — render, crop photos, and (optionally) read names.
-  const carried = new Map<number, string>(); // page -> section heading in force
-  let lastHeading: string | null = null;
   const electors = new Map<number, Elector>();
 
-  const pagesWithBoxes = pages.filter((pg) => pg.boxes.length > 0);
-
-  await pool(pagesWithBoxes, VISION_CONCURRENCY, async (pg) => {
+  await pool(pages, PAGE_CONCURRENCY, async (pg) => {
     const canvas = await renderPage(doc, pg.pageNo, SCALE);
 
-    if (pg.pageNo === pagesWithBoxes[0]!.pageNo) {
+    if (pg.pageNo === pages[0]!.pageNo) {
       await writeFile(
         path.join(DEBUG_DIR, `${partId}-overlay-p${pg.pageNo}.png`),
         await debugOverlay(canvas, pg.boxes, SCALE),
       );
     }
 
-    // Photos first — they never depend on the API, so a missing key or a
-    // rate limit still leaves a complete set of pictures on disk.
-    for (const box of pg.boxes) {
-      if (box.serialNo === null) continue;
-      const id = `${ward}_${partNo}_${box.serialNo}`;
-      await writeFile(path.join(PHOTO_DIR, `${id}.jpg`), await cropPhoto(canvas, box.rect, SCALE));
-    }
-
-    let names: VisionRecord[] = [];
-    if (useVision) {
-      try {
-        names = await readNames(await canvas.encode("png"), pg.boxes);
-      } catch (err) {
-        console.warn(`  ! page ${pg.pageNo}: ${(err as Error).message}`);
+    if (usePhotos) {
+      for (const box of pg.boxes) {
+        if (box.serialNo === null) continue;
+        const id = `${ward}_${partNo}_${box.serialNo}`;
+        await writeFile(path.join(PHOTO_DIR, `${id}.jpg`), await cropPhoto(canvas, box.rect, SCALE));
       }
     }
-    const byserial = new Map(names.map((r) => [Number(r.serial), r]));
+
+    let seen: VisionRecord[] = [];
+    if (useVision) {
+      const perChunk = await pool(chunkBoxes(pg.boxes, BOXES_PER_STRIP), 2, async (chunk) => {
+        try {
+          return await readNames(await cropRegion(canvas, boundsOf(chunk), SCALE), chunk);
+        } catch (err) {
+          console.warn(`  ! page ${pg.pageNo} strip: ${(err as Error).message}`);
+          return [] as VisionRecord[];
+        }
+      });
+      seen = perChunk.flat();
+    }
+    const byserial = new Map(seen.map((r) => [Number(r.serial), r]));
 
     for (const box of pg.boxes) {
       if (box.serialNo === null) continue;
-      const seen = byserial.get(box.serialNo);
-      merge(electors, box, seen, pg, ward, partNo, lastHeading);
+      merge(electors, box, typed, byserial.get(box.serialNo), pg, ward, partNo,
+        sectionFor(box.serialNo, sections), usePhotos);
     }
-    if (pg.headings.length) lastHeading = pg.headings.join(" ");
-    carried.set(pg.pageNo, lastHeading ?? "");
+
     process.stdout.write(`  page ${pg.pageNo}/${doc.numPages}\r`);
   });
   process.stdout.write("\n");
 
   const list = [...electors.values()].sort((a, b) => a.serialNo - b.serialNo);
-  const flagged = list.filter((e) => e.needsReview).length;
-  console.log(`  ${list.length} electors, ${flagged} flagged for review`);
-  if (useVision) console.log(`  vision: ${usage.calls} calls, ~$${costSoFar().toFixed(2)} so far`);
+  const named = list.filter((e) => e.name).length;
+  console.log(`  ${list.length} electors, ${named} with names, ${list.length - named} still blank`);
+  if (useVision) console.log(`  vision: ${usage.calls} calls, ~$${costSoFar().toFixed(2)}`);
 
   const part: PartMeta = {
     id: partId,
@@ -181,118 +298,97 @@ async function extractOne(file: string): Promise<ExtractedPart> {
 }
 
 /**
- * Fold one box's two sources into a row. The text layer wins on serial, EPIC,
- * age, gender and relation type; vision supplies the names and the Hindi text
- * of the house number. Where both have an opinion and disagree, the row is
- * flagged rather than silently resolved.
+ * Fold one box into a row.
+ *
+ * The PDF's own text layer is authoritative for serial, EPIC, age, gender and
+ * relation type — those come out of it exactly. Only the two names come from
+ * reading the page, because the embedded font mangles them irreversibly.
+ * Nothing here is inferred or corrected: a row is what the roll prints.
  */
 function merge(
   out: Map<number, Elector>,
   box: RawBox,
+  typed: NameMap,
   seen: VisionRecord | undefined,
   pg: PageResult,
   ward: string,
   partNo: string,
   heading: string | null,
+  usePhotos: boolean,
 ) {
   const serial = box.serialNo!;
   const id = `${ward}_${partNo}_${serial}`;
   const prior = out.get(serial);
+  const hand = typed[String(serial)];
 
-  const disagreements: string[] = [];
-  if (seen) {
-    if (seen.age != null && box.age != null && seen.age !== box.age) disagreements.push("age");
-    if (seen.gender && box.gender && seen.gender !== box.gender) disagreements.push("gender");
-    if (seen.relation_type && box.relationType && seen.relation_type !== box.relationType) {
-      disagreements.push("relation_type");
-    }
-  }
+  const name = hand?.[0] ?? seen?.name ?? prior?.name ?? null;
+  const relationName = hand?.[1] ?? seen?.relation_name ?? prior?.relationName ?? null;
 
-  const elector: Elector = {
+  out.set(serial, {
     id,
     serialNo: serial,
     epicNo: box.epicNo ?? prior?.epicNo ?? null,
-    name: seen?.name ?? prior?.name ?? null,
-    relationName: seen?.relation_name ?? prior?.relationName ?? null,
-    relationType: box.relationType ?? seen?.relation_type ?? prior?.relationType ?? null,
-    houseNo: seen?.house_no ?? prior?.houseNo ?? null,
-    age: box.age ?? seen?.age ?? prior?.age ?? null,
-    gender: box.gender ?? seen?.gender ?? prior?.gender ?? null,
+    name,
+    relationName,
+    relationType: box.relationType ?? prior?.relationType ?? null,
+    houseNo: null, // dropped on request — the roll's house numbers are not wanted
+    age: box.age ?? prior?.age ?? null,
+    gender: box.gender ?? prior?.gender ?? null,
     sectionLabel: prior?.sectionLabel ?? heading,
     // Supplement additions are the entries printed without an EPIC number.
     listType: box.epicNo ? "main" : "supplement",
-    // A box may be reprinted in the विलोपन सूची appendix; either printing
-    // carrying the marker is enough to mark the person deleted.
     isDeleted: Boolean(box.deletionMark) || Boolean(prior?.isDeleted),
     deletionReason: deletionReason(box.deletionMark) ?? prior?.deletionReason ?? null,
-    photoPath: `/photos/${id}.jpg`,
+    // Only meaningful once the per-person crops have actually been made.
+    photoPath: usePhotos ? `/photos/${id}.jpg` : null,
+    pageImage: `/pages/${ward}_${partNo}_p${String(pg.pageNo).padStart(3, "0")}.jpg`,
     pageNo: prior?.pageNo ?? pg.pageNo,
     boxNo: prior?.boxNo ?? box.boxNo,
-    raw: {
-      ...(prior?.raw ?? {}),
-      textLayer: {
-        serial: box.serialNo,
-        epic: box.epicNo,
-        age: box.age,
-        gender: box.gender,
-        relationType: box.relationType,
-        deletionMark: box.deletionMark,
-        fragments: box.fragments,
-      },
-      vision: seen ?? null,
-      disagreements,
-    },
-    confidence: seen ? (disagreements.length ? 0.6 : 0.95) : 0.4,
-    needsReview: !seen || disagreements.length > 0 || !seen.name,
-  };
-
-  out.set(serial, elector);
+    raw: { textLayer: { fragments: box.fragments }, vision: seen ?? null },
+    confidence: hand ? 1 : seen ? 0.9 : 0,
+    needsReview: !name,
+  });
 }
 
 // ---------------------------------------------------------------- subcommands
 
 async function cmdProbe() {
-  const files = await listPdfs();
-  if (!files.length) return noPdfs();
-  const file = files[0]!;
+  const file = await pickPdf();
   const doc = await openPdf(file);
   console.log(`${path.basename(file)} — ${doc.numPages} pages`);
+  const pages = await contentPages(doc);
+  console.log(`  ${pages.length} pages with electors`);
 
-  for (const p of [1, 3, doc.numPages].filter((v, i, a) => a.indexOf(v) === i && v <= doc.numPages)) {
-    const pg = await readPage(doc, p);
-    console.log(`\n--- page ${p}: ${pg.boxes.length} boxes, ${pg.width.toFixed(0)}x${pg.height.toFixed(0)}pt`);
+  for (const pg of pages.slice(0, 2)) {
+    console.log(`\n--- page ${pg.pageNo}: ${pg.boxes.length} boxes`);
     for (const b of pg.boxes.slice(0, 3)) {
       console.log(
         `  #${b.serialNo} epic=${b.epicNo} age=${b.age} sex=${b.gender} rel=${b.relationType}` +
           ` del=${b.deletionMark ?? "-"} rect=${b.rect.left.toFixed(0)},${b.rect.top.toFixed(0)}` +
           ` ${b.rect.width.toFixed(0)}x${b.rect.height.toFixed(0)}`,
       );
-      console.log(`     fragments: ${JSON.stringify(b.fragments)}`);
     }
-    if (pg.boxes.length) {
-      await mkdir(DEBUG_DIR, { recursive: true });
-      const canvas = await renderPage(doc, p, SCALE);
-      const out = path.join(DEBUG_DIR, `probe-p${p}.png`);
-      await writeFile(out, await debugOverlay(canvas, pg.boxes, SCALE));
-      console.log(`  overlay → ${out}`);
-    }
+    await mkdir(DEBUG_DIR, { recursive: true });
+    const canvas = await renderPage(doc, pg.pageNo, SCALE);
+    const out = path.join(DEBUG_DIR, `probe-p${pg.pageNo}.png`);
+    await writeFile(out, await debugOverlay(canvas, pg.boxes, SCALE));
+    console.log(`  overlay → ${path.relative(ROOT, out)}`);
   }
-  console.log(
-    `\nOpen the overlay PNGs. Red = elector box, blue = photo crop.\n` +
-      `If they are off, nudge PHOTO_LEFT/TOP/RIGHT/BOTTOM or BOX_HEADER_H in .env.local.`,
-  );
+  console.log(`\nRed = elector box, blue = photo crop. Nudge PHOTO_* in .env.local if off.`);
 }
 
-async function cmdExtract() {
-  const files = await listPdfs();
-  if (!files.length) return noPdfs();
+async function cmdCsv() {
+  const file = await pickPdf();
+  const result = await extractOne(file);
   await mkdir(OUT_DIR, { recursive: true });
-  for (const file of files) {
-    const result = await extractOne(file);
-    const out = path.join(OUT_DIR, `${result.part.id}.json`);
-    await writeFile(out, JSON.stringify(result, null, 2));
-    console.log(`  → ${path.relative(ROOT, out)}`);
-  }
+  await mkdir(CSV_DIR, { recursive: true });
+
+  const json = path.join(OUT_DIR, `${result.part.id}.json`);
+  const csv = path.join(CSV_DIR, `${result.part.id}.csv`);
+  await writeFile(json, JSON.stringify(result, null, 2));
+  await writeFile(csv, toCsv(result.electors));
+  console.log(`  → ${path.relative(ROOT, csv)}`);
+  console.log(`  → ${path.relative(ROOT, json)} (provenance; re-runs read this)`);
 }
 
 async function cmdLoad() {
@@ -300,7 +396,7 @@ async function cmdLoad() {
     ? positional
     : (await readdir(OUT_DIR).catch(() => [])).filter((f) => f.endsWith(".json"));
   if (!names.length) {
-    console.error("Nothing in data/extracted/. Run `pnpm ingest extract` first.");
+    console.error("Nothing in data/extracted/. Run `pnpm ingest csv <pdf>` first.");
     process.exitCode = 1;
     return;
   }
@@ -310,31 +406,97 @@ async function cmdLoad() {
     console.log(`\n${path.basename(file)}: ${parsed.electors.length} electors`);
     await loadPart(parsed.part, parsed.electors);
   }
-  console.log("\nDone.");
-}
-
-function noPdfs() {
-  console.error(
-    `No PDFs found.\n` +
-      `Put the roll PDFs in ${path.relative(process.cwd(), PDF_DIR)}/ ` +
-      `(keeping the portal filenames), or pass paths as arguments.`,
-  );
-  process.exitCode = 1;
 }
 
 const commands: Record<string, () => Promise<void>> = {
   probe: cmdProbe,
-  extract: cmdExtract,
+  zoom: cmdZoom,
+  sheets: cmdSheets,
+  csv: cmdCsv,
+  migrate: () => migrate(path.join(ROOT, "supabase", "migrations")),
   load: cmdLoad,
-  all: async () => {
-    await cmdExtract();
-    await cmdLoad();
-  },
 };
 
 const run = commands[command];
 if (!run) {
-  console.error(`Unknown command "${command}". Use: probe | extract | load | all`);
+  console.error(`Unknown command "${command}". Use: probe | sheets | zoom | csv | migrate | load`);
   process.exit(1);
 }
-await run();
+try {
+  await run();
+} catch (err) {
+  console.error(`\n${(err as Error).message}`);
+  process.exit(1);
+}
+
+/**
+ * The section heading in force at a given serial: the latest transcribed
+ * heading whose starting serial is at or before it. Returns null when the
+ * headings for this part have not been transcribed yet — a blank cell is
+ * correct, a garbled one never is.
+ */
+function sectionFor(serial: number, sections: Record<string, string> | undefined): string | null {
+  if (!sections) return null;
+  let best: string | null = null;
+  let bestAt = -1;
+  for (const [at, heading] of Object.entries(sections)) {
+    const start = Number(at);
+    if (Number.isFinite(start) && start <= serial && start > bestAt) {
+      bestAt = start;
+      best = heading;
+    }
+  }
+  return best;
+}
+
+/**
+ * Blow up individual elector boxes.
+ *
+ * A handful of entries on every roll are faded, over-inked or printed over a
+ * dark photo, and are genuinely ambiguous at sheet resolution. Rather than
+ * guess at a person's name, those serials get re-rendered on their own at ~4x
+ * the sheet scale, where the matras resolve.
+ */
+async function cmdZoom() {
+  const file = await pickPdf();
+  const wanted = new Set(positional.slice(1).map(Number).filter(Number.isFinite));
+  if (!wanted.size) throw new Error("Give the serials to zoom, e.g. `pnpm ingest zoom <pdf> 42 118`");
+
+  const { ward, partNo } = identify(file);
+  const dir = path.join(DEBUG_DIR, `zoom-${ward}_${partNo}`);
+  await mkdir(dir, { recursive: true });
+
+  const doc = await openPdf(file);
+  const cut: Array<{ serial: number; png: Buffer }> = [];
+  for (const pg of await contentPages(doc)) {
+    const hits = pg.boxes.filter((b) => b.serialNo !== null && wanted.has(b.serialNo));
+    if (!hits.length) continue;
+    const canvas = await renderPage(doc, pg.pageNo, 9);
+    for (const box of hits) {
+      // Only the text half of the box — the photo carries no name.
+      const png = await cropRegion(canvas, { ...box.rect, width: box.rect.width * 0.7 }, 9, 2000);
+      await writeFile(path.join(dir, `${box.serialNo}.png`), png);
+      cut.push({ serial: box.serialNo!, png });
+      console.log(`  #${box.serialNo} (page ${pg.pageNo})`);
+    }
+  }
+  // Also stack them into one image, so a batch can be re-checked in one look
+  // rather than opening a dozen files.
+  if (cut.length > 1) {
+    cut.sort((a, b) => a.serial - b.serial);
+    const imgs = await Promise.all(cut.map((c) => loadImage(c.png)));
+    const w = Math.max(...imgs.map((i) => i.width));
+    const h = imgs.reduce((n, i) => n + i.height + 8, 0);
+    const sheet = createCanvas(w, h);
+    const ctx = sheet.getContext("2d");
+    ctx.fillStyle = "#888888";
+    ctx.fillRect(0, 0, w, h);
+    let y = 0;
+    for (const i of imgs) {
+      ctx.drawImage(i, 0, y);
+      y += i.height + 8;
+    }
+    await writeFile(path.join(dir, "strip.png"), await sheet.encode("png"));
+    console.log(`  all ${cut.length} stacked → ${path.relative(ROOT, path.join(dir, "strip.png"))}`);
+  }
+}

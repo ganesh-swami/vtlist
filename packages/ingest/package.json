@@ -14,8 +14,10 @@
     "@anthropic-ai/sdk": "^0.123.0",
     "@napi-rs/canvas": "^0.1.85",
     "@supabase/supabase-js": "^2.97.0",
+    "@types/pg": "^8.23.1",
     "@workspace/normalize": "workspace:*",
-    "pdfjs-dist": "^4.10.38"
+    "pdfjs-dist": "^4.10.38",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/node": "^20",
