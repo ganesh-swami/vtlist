@@ -9,6 +9,8 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { createClient } from "@/utils/supabase/client";
+
 import type { VoterResult as Result } from "@/utils/supabase/types";
 
 
@@ -70,13 +72,25 @@ export default function Page() {
 
   return (
     <main className="mx-auto min-h-svh w-full max-w-5xl px-4 py-8">
-      <header className="mb-6">
+      <header className="mb-6 flex items-start justify-between gap-4">
+        <div>
         <h1 className="text-2xl font-semibold tracking-tight">मतदाता खोज</h1>
         <p className="text-muted-foreground mt-1 text-sm">
           बीकानेर नगर निगम · वार्ड 1 — नाम हिंदी या अंग्रेज़ी में लिखें
           <span className="mx-1.5 opacity-40">·</span>
           Type a name in Hindi or English. Spelling does not have to be exact.
         </p>
+        </div>
+        <button
+          onClick={async () => {
+            await createClient().auth.signOut();
+            // Full navigation so the proxy sees the cleared cookie.
+            window.location.assign("/login");
+          }}
+          className="text-muted-foreground hover:text-foreground shrink-0 rounded-md border px-3 py-1.5 text-sm"
+        >
+          साइन आउट
+        </button>
       </header>
 
       <div className="bg-background/80 sticky top-0 z-10 -mx-1 border-b px-1 pb-3 pt-1 backdrop-blur">

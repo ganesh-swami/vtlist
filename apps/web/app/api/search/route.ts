@@ -4,26 +4,42 @@
  * The query is folded here — in the same `@workspace/normalize` code that
  * folded the names at import time — and the folded forms are what reach the
  * database. That is what lets "Rameshwar", "Rameshvar" and रामेश्वर all find
- * the same person: Postgres only ever compares like with like.
+ * the same person — and, since the abbreviation pass, why "Md Hanif" finds
+ * "मो॰हनीफ": Postgres only ever compares like with like.
+ *
+ * The client is built per request from the request's own cookies rather than
+ * being a module-level singleton, so every query runs as the signed-in user and
+ * row-level security applies. A request with no session gets nothing back from
+ * the database even if this route's own check were somehow bypassed.
  */
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
 import { nameForms, queryForms } from "@workspace/normalize";
 import type { Database } from "@/utils/supabase/types";
 
-// Built on first request, not at module load, so a missing env var surfaces as
-// a 500 with a readable message instead of failing the whole build.
-let client: ReturnType<typeof createClient<Database>> | null = null;
-function supabase() {
-  client ??= createClient<Database>(
+export async function GET(request: Request) {
+  const cookieStore = await cookies();
+  const supabase = createServerClient<Database>(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
-    { auth: { persistSession: false } },
+    {
+      cookies: {
+        getAll: () => cookieStore.getAll(),
+        setAll: () => {
+          // Read-only route; the proxy has already refreshed the session.
+        },
+      },
+    },
   );
-  return client;
-}
 
-export async function GET(request: Request) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "not signed in", results: [] }, { status: 401 });
+  }
+
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") ?? "").trim();
   const relation = (url.searchParams.get("relation") ?? "").trim();
@@ -40,7 +56,7 @@ export async function GET(request: Request) {
 
   const forms = queryForms(q);
 
-  const { data, error } = await supabase().rpc("search_voters", {
+  const { data, error } = await supabase.rpc("search_voters", {
     q_raw: q,
     q_hi: forms.hi,
     q_key: forms.key,

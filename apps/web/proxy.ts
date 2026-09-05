@@ -50,8 +50,15 @@ export async function proxy(request: NextRequest) {
   const isPublic = PUBLIC.some((p) => pathname === p || pathname.startsWith(p + "/"));
 
   if (!user && !isPublic) {
+    // An API caller gets a status it can act on. Redirecting would hand a
+    // `fetch` a page of HTML with a 200, which reads as a successful empty
+    // result — the client could not tell an expired session from no matches.
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json({ error: "not signed in", results: [] }, { status: 401 });
+    }
     const login = request.nextUrl.clone();
     login.pathname = "/login";
+    login.search = "";
     login.searchParams.set("next", pathname + request.nextUrl.search);
     return NextResponse.redirect(login);
   }
