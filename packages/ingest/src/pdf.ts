@@ -68,7 +68,11 @@ export const TOKENS = {
 const is = (s: string, list: readonly string[]) => list.includes(s.trim());
 
 /** EPIC numbers, both the modern and the older RJ/xx/xxx/xxxxxx form. */
-const EPIC = /^(?:[A-Z]{3}\d{7}|RJ\/\d{2}\/\d{3}\/\d{6})$/;
+// The state prefix on the slashed form is NOT always RJ: an elector who
+// transferred in keeps the number their previous state issued (part 1 serial
+// 751 carries a UP one). Hard-coding RJ nulled those EPICs and, because a
+// missing EPIC is what marks a supplement entry, quietly misfiled the row as पूरक.
+const EPIC = /^(?:[A-Z]{3}\d{7}|[A-Z]{2}\/\d{2}\/\d{3}\/\d{6})$/;
 /** A serial number, as printed in the roll's dedicated serial font. */
 const SERIAL = /^\d{1,5}$/;
 /** The deletion marker printed immediately left of a struck-off serial. */
@@ -239,23 +243,35 @@ export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
     if (SERIAL.test(i.str)) (numeric.get(i.font) ?? numeric.set(i.font, []).get(i.font)!).push(i);
   }
 
+  // Score each font by its LONGEST unbroken run, not by how consecutive the
+  // whole group is, and keep only that run as the anchors.
+  //
+  // Requiring the whole group to count broke on the last supplement page, where
+  // the few remaining पूरक boxes are printed above the विलोपन सूची and share its
+  // font: four consecutive serials followed by a scatter of struck-off ones
+  // scored 0.21 and the page — four real electors — was dropped silently. A run
+  // still rules out ages and house numbers, which never count upward in box
+  // order, and still rejects a deletion appendix on its own.
   let serialFont = "";
-  let best = 0;
+  let bestRun: Item[] = [];
   for (const [font, group] of numeric) {
-    if (group.length < 3) continue;
-    const run = [...group].sort((a, b) => a.top - b.top || a.x - b.x).map((i) => Number(i.str));
-    const steps = run.slice(1).filter((v, k) => v - run[k]! === 1).length;
-    const consecutive = steps / (run.length - 1);
-    if (consecutive >= 0.8 && group.length > best) {
+    const ordered = readingOrder(group);
+    let run: Item[] = [];
+    let longest: Item[] = [];
+    for (const item of ordered) {
+      const prev = run.at(-1);
+      if (prev && Number(item.str) === Number(prev.str) + 1) run.push(item);
+      else run = [item];
+      if (run.length > longest.length) longest = [...run];
+    }
+    if (longest.length >= 3 && longest.length > bestRun.length) {
       serialFont = font;
-      best = group.length;
+      bestRun = longest;
     }
   }
   if (!serialFont) return empty;
 
-  const anchors = numeric
-    .get(serialFont)!
-    .sort((a, b) => a.top - b.top || a.x - b.x);
+  const anchors = bestRun;
 
   const colXs = cluster(anchors.map((a) => a.x), 40);
   const rowTops = cluster(anchors.map((a) => a.top), 12);
@@ -338,8 +354,13 @@ export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
       }
     }
 
-    boxes.push(box);
+    // A stray run of small numbers on a summary page (part 1 page 49 prints
+    // '1, 2, 3' in the serial font) otherwise becomes three phantom electors.
+    // A real box always carries at least one printed field label.
+    if (looksLikeElectorBox(box.fragments)) boxes.push(box);
   }
+
+  if (!boxes.length) return empty;
 
   const firstTop = Math.min(...boxes.map((b) => b.rect.top));
   const headings = items
@@ -532,4 +553,37 @@ export async function cropToJpeg(
   ctx.fillRect(0, 0, out.width, out.height);
   ctx.drawImage(pageCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
   return await out.encode("jpeg", quality);
+}
+
+/**
+ * Sort items the way the page is read: row by row, left to right.
+ *
+ * Sorting on the raw `top` is not enough — baselines within a row wobble by a
+ * point or two (on part 1 page 39 the serial 971 sits just below 972 and 973),
+ * which scrambles the order and, since the serial run is detected from that
+ * order, silently truncates the page. Grouping into rows with a tolerance first
+ * keeps the run intact.
+ */
+function readingOrder(items: Item[], tolerance = 6): Item[] {
+  const sorted = [...items].sort((a, b) => a.top - b.top);
+  const rows: Item[][] = [];
+  for (const i of sorted) {
+    const last = rows.at(-1);
+    if (last && Math.abs(i.top - last[0]!.top) <= tolerance) last.push(i);
+    else rows.push([i]);
+  }
+  return rows.flatMap((r) => r.sort((a, b) => a.x - b.x));
+}
+
+/** Whether a box holds any of the roll's printed field labels. */
+function looksLikeElectorBox(fragments: string[]): boolean {
+  return fragments.some(
+    (f) =>
+      is(f, TOKENS.father) ||
+      is(f, TOKENS.husband) ||
+      is(f, TOKENS.mother) ||
+      is(f, TOKENS.other) ||
+      is(f, TOKENS.ageLabel) ||
+      is(f, TOKENS.houseLabel),
+  );
 }

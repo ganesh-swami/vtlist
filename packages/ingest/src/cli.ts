@@ -5,6 +5,7 @@
  *   pnpm ingest probe   <pdf>   check box detection, write a debug overlay
  *   pnpm ingest sheets  <pdf>   write one legible page image per page, for
  *                               transcribing the names by eye
+ *   pnpm ingest headings <pdf>  find every section heading and render it
  *   pnpm ingest zoom    <pdf> <serial...>   blow up single boxes to re-check
  *                               a name that was hard to read
  *   pnpm ingest csv     <pdf>   structure + names -> data/csv/<part>.csv
@@ -158,7 +159,11 @@ async function cmdSheets() {
   const index: Record<string, number[]> = {};
   await pool(pages, PAGE_CONCURRENCY, async (pg) => {
     const canvas = await renderPage(doc, pg.pageNo, SHEET_SCALE);
-    const rect = boundsOf(pg.boxes, 4);
+    // Reach 40pt above the grid: the section heading for the first box on a
+    // page sits outside the boxes, and cropping it away leaves those electors
+    // with no locality.
+    const grid = boundsOf(pg.boxes, 4);
+    const rect = { ...grid, top: Math.max(0, grid.top - 40), height: grid.height + 40 };
     const name = `p${String(pg.pageNo).padStart(3, "0")}.png`;
 
     // PNG for transcription (lossless, nothing to second-guess) …
@@ -411,6 +416,7 @@ async function cmdLoad() {
 const commands: Record<string, () => Promise<void>> = {
   probe: cmdProbe,
   zoom: cmdZoom,
+  headings: cmdHeadings,
   sheets: cmdSheets,
   csv: cmdCsv,
   migrate: () => migrate(path.join(ROOT, "supabase", "migrations")),
@@ -419,7 +425,7 @@ const commands: Record<string, () => Promise<void>> = {
 
 const run = commands[command];
 if (!run) {
-  console.error(`Unknown command "${command}". Use: probe | sheets | zoom | csv | migrate | load`);
+  console.error(`Unknown command "${command}". Use: probe | sheets | headings | zoom | csv | migrate | load`);
   process.exit(1);
 }
 try {
@@ -499,4 +505,86 @@ async function cmdZoom() {
     await writeFile(path.join(dir, "strip.png"), await sheet.encode("png"));
     console.log(`  all ${cut.length} stacked → ${path.relative(ROOT, path.join(dir, "strip.png"))}`);
   }
+}
+
+/**
+ * Find every section heading in a roll and render it for transcription.
+ *
+ * Headings are printed between rows of boxes, not inside them, so they are easy
+ * to miss by eye — and the text layer's copy of them is garbled like every
+ * other Devanagari string. They are found here structurally instead: a vertical
+ * gap between two box rows that is wider than the page's usual row pitch means
+ * a heading was set in between, and the first serial of the row below is where
+ * that section begins. Page-top headings are picked up from the leftover text
+ * above the first row.
+ *
+ * Expect false positives: a house number long enough to wrap also pushes the
+ * next row down. That is why this renders the strips rather than trusting the
+ * geometry — a glance tells a locality name from a wrapped address.
+ */
+async function cmdHeadings() {
+  const file = await pickPdf();
+  const { ward, partNo } = identify(file);
+  const dir = path.join(DEBUG_DIR, `headings-${ward}_${partNo}`);
+  await mkdir(dir, { recursive: true });
+
+  const doc = await openPdf(file);
+  const cut: Array<{ serial: number; png: Buffer }> = [];
+
+  for (const pg of await contentPages(doc)) {
+    const rows = [...new Set(pg.boxes.map((b) => Math.round(b.rect.top)))].sort((a, b) => a - b);
+    const at: number[] = [];
+
+    // A heading above the first row of the page (only when the page opens one).
+    if (pg.headings.length) at.push(rows[0]!);
+    // Headings between rows.
+    if (rows.length > 1) {
+      const steps = rows.slice(1).map((v, i) => v - rows[i]!).sort((a, b) => a - b);
+      const pitch = steps[Math.floor(steps.length / 2)]!;
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i]! - rows[i - 1]! > pitch + 8) at.push(rows[i]!);
+      }
+    }
+    if (!at.length) continue;
+
+    const canvas = await renderPage(doc, pg.pageNo, 3.2);
+    const left = Math.min(...pg.boxes.map((b) => b.rect.left));
+    const width = Math.max(...pg.boxes.map((b) => b.rect.left + b.rect.width)) - left;
+
+    for (const top of at) {
+      const serial = pg.boxes
+        .filter((b) => Math.abs(b.rect.top - top) < 3)
+        .map((b) => b.serialNo!)
+        .sort((a, b) => a - b)[0];
+      if (serial === undefined) continue;
+      const png = await cropRegion(
+        canvas,
+        { left, top: Math.max(0, top - 34), width, height: 34 },
+        3.2,
+        2200,
+      );
+      await writeFile(path.join(dir, `${serial}.png`), png);
+      cut.push({ serial, png });
+      console.log(`  heading before serial ${serial} (page ${pg.pageNo})`);
+    }
+  }
+
+  if (cut.length > 1) {
+    cut.sort((a, b) => a.serial - b.serial);
+    const imgs = await Promise.all(cut.map((c) => loadImage(c.png)));
+    const w = Math.max(...imgs.map((i) => i.width));
+    const h = imgs.reduce((n, i) => n + i.height + 6, 0);
+    const sheet = createCanvas(w, h);
+    const ctx = sheet.getContext("2d");
+    ctx.fillStyle = "#888888";
+    ctx.fillRect(0, 0, w, h);
+    let y = 0;
+    for (const i of imgs) {
+      ctx.drawImage(i, 0, y);
+      y += i.height + 6;
+    }
+    await writeFile(path.join(dir, "all.png"), await sheet.encode("png"));
+    console.log(`  ${cut.length} headings → ${path.relative(ROOT, path.join(dir, "all.png"))}`);
+  }
+  console.log(`  serials: ${JSON.stringify(cut.map((c) => c.serial))}`);
 }
