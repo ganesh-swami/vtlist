@@ -36,6 +36,21 @@ printed boxes, every page will crop correctly; if not, nudge `PHOTO_LEFT` /
 The public Supabase keys the website uses live in `apps/web/.env.local`; the two
 secrets above deliberately stay out of that directory so Next.js never sees them.
 
+
+## Access control
+
+The site requires a login — no public sign-up. Create an account with:
+
+```bash
+node --env-file-if-exists=.env.local packages/ingest/src/create-user.ts you@example.com 'password'
+```
+
+Enforcement is in three layers: row-level security in the database (the one
+that matters — the publishable key ships to every browser), the route guard in
+`apps/web/proxy.ts`, and an authenticated image route, because page scans must
+not sit in `public/` where the static handler serves them before any auth code
+runs. Details and the verification table: [docs/access-control.md](docs/access-control.md).
+
 ## How it works
 
 **Ids.** Every row's id is its position on the roll: `{ward}_{part}_{serial}`,
