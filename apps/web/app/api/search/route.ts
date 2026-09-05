@@ -43,6 +43,10 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") ?? "").trim();
   const relation = (url.searchParams.get("relation") ?? "").trim();
+  // EPIC numbers get pasted from all sorts of sources (a PDF, a screenshot's
+  // OCR, a messaging app) — strip the invisible characters that habit tends to
+  // drag along, so a copy-pasted number is not silently unequal to itself.
+  const epic = (url.searchParams.get("epic") ?? "").replace(/[\u200B-\u200D\uFEFF\s]/g, "");
   const gender = url.searchParams.get("gender");
   const part = url.searchParams.get("part");
   const ageMin = url.searchParams.get("age_min");
@@ -50,7 +54,7 @@ export async function GET(request: Request) {
   const page = Math.max(0, Number(url.searchParams.get("page") ?? 0));
   const limit = 60;
 
-  if (!q && !relation && !gender && !part && !ageMin && !ageMax) {
+  if (!q && !relation && !epic && !gender && !part && !ageMin && !ageMax) {
     return NextResponse.json({ results: [], total: 0 });
   }
 
@@ -62,6 +66,7 @@ export async function GET(request: Request) {
     q_key: forms.key,
     q_skeleton: forms.skeleton,
     f_relation: relation ? nameForms(relation).key : "",
+    f_epic: epic,
     f_gender: gender || null,
     f_age_min: ageMin ? Number(ageMin) : null,
     f_age_max: ageMax ? Number(ageMax) : null,

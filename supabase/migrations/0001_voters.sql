@@ -148,6 +148,7 @@ create or replace function public.search_voters(
   q_key      text default '',
   q_skeleton text default '',
   f_relation text default '',   -- normalised key of a father/husband name
+  f_epic     text default '',   -- exact EPIC number, from its own dedicated box
   f_gender   text default null,
   f_age_min  int  default null,
   f_age_max  int  default null,
@@ -171,11 +172,9 @@ as $fn$
       v.*,
       (
         greatest(
-          -- an exact EPIC number is never ambiguous, so it outranks everything
-          case when v.epic_no is not null and upper(v.epic_no) = upper(trim(q_raw))
+          -- an exact EPIC number, from its own box, is never ambiguous
+          case when f_epic <> '' and upper(v.epic_no) = upper(trim(f_epic))
                then 2.0 else 0 end,
-          -- so is the roll id itself, e.g. someone pasting '1_3_57'
-          case when v.id = trim(q_raw) then 2.0 else 0 end,
           case when q_key <> '' then similarity(v.name_key, q_key) else 0 end,
           case when q_hi  <> '' then similarity(v.name_hi,  q_hi) * 0.98 else 0 end,
           case when q_key <> '' then similarity(v.relation_name_key, q_key) * 0.80 else 0 end,
@@ -190,8 +189,7 @@ as $fn$
         - case when v.is_deleted then 0.20 else 0 end
       )::real as score,
       case
-        when v.epic_no is not null and upper(v.epic_no) = upper(trim(q_raw)) then 'epic'
-        when v.id = trim(q_raw) then 'id'
+        when f_epic <> '' and upper(v.epic_no) = upper(trim(f_epic)) then 'epic'
         when q_key <> ''
              and similarity(v.name_key, q_key) >= similarity(v.relation_name_key, q_key)
           then 'name'
@@ -203,6 +201,12 @@ as $fn$
       and (f_age_min is null or v.age >= f_age_min)
       and (f_age_max is null or v.age <= f_age_max)
       and (f_part    is null or v.part_no = f_part)
+      -- EPIC has its own dedicated box now — an exact, case-insensitive match,
+      -- never fuzzy. A blank box imposes no filter at all.
+      and (
+        f_epic = ''
+        or upper(v.epic_no) = upper(trim(f_epic))
+      )
       -- Father/husband filter, when the user fills that box separately.
       -- pg_trgm's % operator alone is too generous here: "lal" is shared by half
       -- the roll, so "शंकर लाल स्वामी" squeaked past a filter for "रामेश्वर लाल".
@@ -212,6 +216,10 @@ as $fn$
         or (v.relation_name_key % f_relation
             and similarity(v.relation_name_key, f_relation) >= 0.45)
       )
+      -- Only three things are searchable through the main box: name, the
+      -- relative's name, and — through its own box above — the EPIC number.
+      -- House number used to be a fourth path in here; it never will be again,
+      -- so a query is never silently matched against an address fragment.
       and (
         trim(q_raw) = ''
         or (q_key      <> '' and v.name_key              % q_key)
@@ -220,9 +228,6 @@ as $fn$
         or (q_hi       <> '' and v.relation_name_hi      % q_hi)
         or (q_skeleton <> '' and v.name_skeleton          = q_skeleton)
         or (q_skeleton <> '' and v.relation_name_skeleton = q_skeleton)
-        or (v.epic_no  is not null and upper(v.epic_no) = upper(trim(q_raw)))
-        or (v.id = trim(q_raw))
-        or (v.house_no is not null and v.house_no = trim(q_raw))
       )
   )
   select id, name_hi, name_latin,
@@ -232,7 +237,7 @@ as $fn$
          is_deleted, photo_path, page_image, page_no,
          score, matched_on
   from scored
-  where score > 0 or trim(q_raw) = ''
+  where score > 0 or (trim(q_raw) = '' and f_epic = '')
   order by score desc, part_no asc, serial_no asc
   limit least(coalesce(lim, 60), 200)
   offset greatest(coalesce(off, 0), 0);

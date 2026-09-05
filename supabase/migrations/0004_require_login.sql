@@ -19,11 +19,23 @@ create policy parts_read on public.voter_parts
 
 -- search_voters() is SECURITY INVOKER (the default), so it reads through the
 -- caller's own policies — an anonymous caller sees an empty table, not a leak.
-revoke all on function public.search_voters(
-  text, text, text, text, text, text, int, int, text, int, int
-) from anon;
-grant execute on function public.search_voters(
-  text, text, text, text, text, text, int, int, text, int, int
-) to authenticated;
+--
+-- Looped over every overload rather than naming one signature: 0001 drops and
+-- recreates search_voters() as its parameter list evolves (an f_epic box was
+-- added after this file first shipped), and a revoke/grant naming the old
+-- signature would fail outright once that signature no longer exists.
+do $grants$
+declare sig text;
+begin
+  for sig in
+    select oid::regprocedure::text
+    from pg_proc
+    where pronamespace = 'public'::regnamespace and proname = 'search_voters'
+  loop
+    execute 'revoke all on function ' || sig || ' from anon';
+    execute 'grant execute on function ' || sig || ' to authenticated';
+  end loop;
+end
+$grants$;
 
 revoke select on public.voters, public.voter_parts from anon;

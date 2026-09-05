@@ -38,6 +38,7 @@ export type SearchArgs = {
   q_key: string;
   q_skeleton: string;
   f_relation: string;
+  f_epic: string;
   f_gender: string | null;
   f_age_min: number | null;
   f_age_max: number | null;

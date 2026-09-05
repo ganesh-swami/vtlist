@@ -1,18 +1,25 @@
 "use client";
 
 /**
- * Voter search — one box, results as you type.
+ * Voter search.
  *
- * Deliberately plain: someone looking for a relative should be able to type a
- * name however they know how to spell it, in Hindi or in English letters, and
- * see faces. Filters stay collapsed until asked for.
+ * Search runs only when asked — a button click, or Enter in either box —
+ * never on every keystroke. That is a deliberate change from an earlier,
+ * type-to-search version: refreshing the results list mid-keystroke reflowed
+ * the page under a phone's paste popover often enough to make pasting into
+ * the box unreliable, and firing a request per character wastes both bandwidth
+ * and database work.
+ *
+ * The EPIC number gets its own box, always visible, never mixed into the name
+ * box: it should never be less than an exact match, and folding it through the
+ * same fuzzy pipeline as a name was exactly the mixing that once made it not
+ * work reliably.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 import { createClient } from "@/utils/supabase/client";
-
+import { VoterModal } from "@/components/voter-modal";
 import type { VoterResult as Result } from "@/utils/supabase/types";
-
 
 const RELATION_LABEL: Record<string, string> = {
   father: "पिता",
@@ -22,8 +29,17 @@ const RELATION_LABEL: Record<string, string> = {
 };
 const GENDER_LABEL: Record<string, string> = { M: "पुरुष", F: "स्त्री", O: "तृतीय लिंग" };
 
+/** Attributes that keep mobile keyboards out of the way of a plain paste. */
+const PASTE_FRIENDLY = {
+  autoComplete: "off",
+  autoCorrect: "off",
+  autoCapitalize: "none",
+  spellCheck: false,
+} as const;
+
 export default function Page() {
   const [q, setQ] = useState("");
+  const [epic, setEpic] = useState("");
   const [relation, setRelation] = useState("");
   const [gender, setGender] = useState("");
   const [part, setPart] = useState("");
@@ -33,53 +49,62 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
+  const [selected, setSelected] = useState<Result | null>(null);
 
-  const params = useMemo(() => {
-    const p = new URLSearchParams();
-    if (q.trim()) p.set("q", q.trim());
-    if (relation.trim()) p.set("relation", relation.trim());
-    if (gender) p.set("gender", gender);
-    if (part.trim()) p.set("part", part.trim());
-    return p.toString();
-  }, [q, relation, gender, part]);
+  // Guards against an old request winning a race against a newer one — the
+  // same job the debounce ticket used to do, just triggered by clicks now
+  // instead of keystrokes.
+  const ticket = useRef(0);
 
-  const latest = useRef(0);
+  async function runSearch() {
+    const params = new URLSearchParams();
+    if (q.trim()) params.set("q", q.trim());
+    if (epic.trim()) params.set("epic", epic.trim());
+    if (relation.trim()) params.set("relation", relation.trim());
+    if (gender) params.set("gender", gender);
+    if (part.trim()) params.set("part", part.trim());
+    const query = params.toString();
 
-  useEffect(() => {
-    if (!params) {
+    if (!query) {
       setResults([]);
       setSearched(false);
+      setError(null);
       return;
     }
-    const ticket = ++latest.current;
+
+    const mine = ++ticket.current;
     setLoading(true);
-    const timer = setTimeout(async () => {
-      try {
-        const res = await fetch(`/api/search?${params}`);
-        const json = await res.json();
-        if (ticket !== latest.current) return; // a newer keystroke already won
-        setError(json.error ?? null);
-        setResults(json.results ?? []);
-        setSearched(true);
-      } catch (err) {
-        if (ticket === latest.current) setError((err as Error).message);
-      } finally {
-        if (ticket === latest.current) setLoading(false);
-      }
-    }, 250);
-    return () => clearTimeout(timer);
-  }, [params]);
+    try {
+      const res = await fetch(`/api/search?${query}`);
+      const json = await res.json();
+      if (mine !== ticket.current) return; // superseded by a later click
+      setError(json.error ?? null);
+      setResults(json.results ?? []);
+      setSearched(true);
+    } catch (err) {
+      if (mine === ticket.current) setError((err as Error).message);
+    } finally {
+      if (mine === ticket.current) setLoading(false);
+    }
+  }
+
+  function onEnter(e: React.KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void runSearch();
+    }
+  }
 
   return (
     <main className="mx-auto min-h-svh w-full max-w-5xl px-4 py-8">
       <header className="mb-6 flex items-start justify-between gap-4">
         <div>
-        <h1 className="text-2xl font-semibold tracking-tight">मतदाता खोज</h1>
-        <p className="text-muted-foreground mt-1 text-sm">
-          बीकानेर नगर निगम · वार्ड 1 — नाम हिंदी या अंग्रेज़ी में लिखें
-          <span className="mx-1.5 opacity-40">·</span>
-          Type a name in Hindi or English. Spelling does not have to be exact.
-        </p>
+          <h1 className="text-2xl font-semibold tracking-tight">मतदाता खोज</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            बीकानेर नगर निगम · वार्ड 1 — नाम हिंदी या अंग्रेज़ी में लिखें
+            <span className="mx-1.5 opacity-40">·</span>
+            Type a name in Hindi or English. Spelling does not have to be exact.
+          </p>
         </div>
         <button
           onClick={async () => {
@@ -94,13 +119,35 @@ export default function Page() {
       </header>
 
       <div className="bg-background/80 sticky top-0 z-10 -mx-1 border-b px-1 pb-3 pt-1 backdrop-blur">
-        <input
-          autoFocus
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder="नाम, पिता/पति का नाम, मकान नं., EPIC…   e.g. Rameshwar / रामेश्वर / IXQ0584201"
-          className="border-input bg-background focus-visible:ring-ring w-full rounded-lg border px-4 py-3 text-base outline-none focus-visible:ring-2"
-        />
+        <div className="flex gap-2">
+          <input
+            autoFocus
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={onEnter}
+            placeholder="नाम या पिता/पति का नाम — name or father's/husband's name"
+            className="border-input bg-background focus-visible:ring-ring w-full rounded-lg border px-4 py-3 text-base outline-none focus-visible:ring-2"
+            {...PASTE_FRIENDLY}
+          />
+        </div>
+
+        <div className="mt-2 flex gap-2">
+          <input
+            value={epic}
+            onChange={(e) => setEpic(e.target.value)}
+            onKeyDown={onEnter}
+            placeholder="EPIC नंबर — e.g. IXQ0584201"
+            className="border-input bg-background focus-visible:ring-ring w-full rounded-lg border px-4 py-2.5 font-mono text-sm outline-none focus-visible:ring-2"
+            {...PASTE_FRIENDLY}
+          />
+          <button
+            onClick={() => void runSearch()}
+            disabled={loading}
+            className="bg-primary text-primary-foreground shrink-0 rounded-lg px-5 text-sm font-medium disabled:opacity-60"
+          >
+            {loading ? "खोज रहे हैं…" : "खोजें"}
+          </button>
+        </div>
 
         <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
           <button
@@ -109,7 +156,6 @@ export default function Page() {
           >
             {showFilters ? "फ़िल्टर छुपाएँ" : "और फ़िल्टर (filters)"}
           </button>
-          {loading && <span className="text-muted-foreground">खोज रहे हैं…</span>}
           {!loading && searched && (
             <span className="text-muted-foreground">{results.length} परिणाम</span>
           )}
@@ -120,8 +166,10 @@ export default function Page() {
             <input
               value={relation}
               onChange={(e) => setRelation(e.target.value)}
+              onKeyDown={onEnter}
               placeholder="पिता / पति का नाम"
               className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none"
+              {...PASTE_FRIENDLY}
             />
             <select
               value={gender}
@@ -136,8 +184,10 @@ export default function Page() {
             <input
               value={part}
               onChange={(e) => setPart(e.target.value)}
+              onKeyDown={onEnter}
               placeholder="भाग संख्या (part no.)"
               className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none"
+              {...PASTE_FRIENDLY}
             />
           </div>
         )}
@@ -149,9 +199,9 @@ export default function Page() {
         </p>
       )}
 
-      {!params && (
+      {!searched && !loading && (
         <p className="text-muted-foreground mt-16 text-center text-sm">
-          ऊपर नाम लिखकर खोजना शुरू करें
+          नाम या EPIC नंबर लिखकर &quot;खोजें&quot; दबाएँ — enter a name or EPIC number and press Search
         </p>
       )}
 
@@ -165,11 +215,21 @@ export default function Page() {
         {results.map((r) => (
           <li
             key={r.id}
-            className="bg-card flex gap-3 rounded-lg border p-3 shadow-sm"
+            onClick={() => setSelected(r)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setSelected(r);
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            className="bg-card hover:border-primary/50 flex cursor-pointer gap-3 rounded-lg border p-3 shadow-sm transition-colors"
             style={r.is_deleted ? { opacity: 0.65 } : undefined}
           >
-            {/* Only part 3 has per-person crops; everyone else gets a link to
-                the page scan instead, which is why this is conditional. */}
+            {/* Only part 3 has per-person crops; everyone else shows no
+                thumbnail here, but the click-through dialog always has an
+                image — the full page scan when there is no individual crop. */}
             {r.photo_path && (
               // eslint-disable-next-line @next/next/no-img-element
               <img
@@ -203,28 +263,11 @@ export default function Page() {
               </div>
 
               <div className="text-muted-foreground mt-1 text-xs leading-relaxed">
-                आयु {r.age ?? "—"} · {GENDER_LABEL[r.gender ?? ""] ?? "—"} · मकान{" "}
-                {r.house_no || "—"}
-                {r.epic_no && (
-                  <>
-                    <br />
-                    <span className="font-mono">{r.epic_no}</span>
-                  </>
-                )}
+                आयु {r.age ?? "—"} · {GENDER_LABEL[r.gender ?? ""] ?? "—"}
                 <br />
-                {r.page_image ? (
-                  <a
-                    href={r.page_image}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="font-mono underline underline-offset-2 opacity-70 hover:opacity-100"
-                    title="मूल पृष्ठ देखें — open the roll page and zoom to this क्रम संख्या"
-                  >
-                    {r.id}
-                  </a>
-                ) : (
-                  <span className="font-mono opacity-70">{r.id}</span>
-                )}
+                EPIC: <span className="font-mono">{r.epic_no || "—"}</span>
+                <br />
+                <span className="font-mono opacity-70">{r.id}</span>
                 <span className="opacity-70">
                   {" "}
                   · वार्ड {r.ward} · भाग {r.part_no} · क्रम {r.serial_no} · पृष्ठ {r.page_no}
@@ -239,6 +282,8 @@ export default function Page() {
           </li>
         ))}
       </ul>
+
+      {selected && <VoterModal voter={selected} onClose={() => setSelected(null)} />}
     </main>
   );
 }
