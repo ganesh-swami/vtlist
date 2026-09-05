@@ -84,7 +84,7 @@ create table if not exists public.voters (
   -- one blob so a single search box can span name + relation + house
   search_blob       text,
 
-  photo_path        text,                    -- '/photos/1_3_57.jpg'
+  photo_path        text,                    -- '/photos/1_3_57.jpg' (part 3 only)
   source_file       text not null,
   page_no           int  not null,
   box_no            int,
@@ -94,6 +94,13 @@ create table if not exists public.voters (
   needs_review      boolean not null default false,
   created_at        timestamptz not null default now()
 );
+
+-- Columns added after the table first shipped. Stated as alters so this file
+-- stays re-runnable against an existing database, not just a fresh one.
+alter table public.voters add column if not exists page_image text;
+comment on column public.voters.page_image is
+  'Scan of the whole printed page this elector sits on — one image per page.';
+comment on column public.voters.house_no is 'deprecated: no longer extracted';
 
 create index if not exists voters_part_idx     on public.voters (part_id, serial_no);
 create index if not exists voters_epic_idx     on public.voters (upper(epic_no));
@@ -119,6 +126,22 @@ create index if not exists voters_blob_trgm     on public.voters using gin (sear
 --   q_hi       Devanagari form (empty when they typed Latin)
 --   q_key      folded fuzzy key
 --   q_skeleton vowel-free skeleton
+-- Postgres refuses to replace a function whose return type changed, so drop
+-- every existing overload first. That keeps this migration re-runnable as the
+-- returned column list evolves.
+do $drop$
+declare sig text;
+begin
+  for sig in
+    select oid::regprocedure::text
+    from pg_proc
+    where pronamespace = 'public'::regnamespace and proname = 'search_voters'
+  loop
+    execute 'drop function if exists ' || sig;
+  end loop;
+end
+$drop$;
+
 create or replace function public.search_voters(
   q_raw      text,
   q_hi       text default '',
@@ -137,7 +160,7 @@ returns table (
   relation_type text, relation_name_hi text, relation_name_latin text,
   house_no text, age int, gender text, epic_no text,
   ward text, part_no text, serial_no int, section_label text,
-  is_deleted boolean, photo_path text, page_no int,
+  is_deleted boolean, photo_path text, page_image text, page_no int,
   score real, matched_on text
 )
 language sql
@@ -180,8 +203,15 @@ as $fn$
       and (f_age_min is null or v.age >= f_age_min)
       and (f_age_max is null or v.age <= f_age_max)
       and (f_part    is null or v.part_no = f_part)
-      -- father/husband filter, when the user fills that box separately
-      and (f_relation = '' or v.relation_name_key % f_relation)
+      -- Father/husband filter, when the user fills that box separately.
+      -- pg_trgm's % operator alone is too generous here: "lal" is shared by half
+      -- the roll, so "शंकर लाल स्वामी" squeaked past a filter for "रामेश्वर लाल".
+      -- Keep % so the GIN index is still used, then insist on a real score.
+      and (
+        f_relation = ''
+        or (v.relation_name_key % f_relation
+            and similarity(v.relation_name_key, f_relation) >= 0.45)
+      )
       and (
         trim(q_raw) = ''
         or (q_key      <> '' and v.name_key              % q_key)
@@ -199,7 +229,7 @@ as $fn$
          relation_type, relation_name_hi, relation_name_latin,
          house_no, age, gender, epic_no,
          ward, part_no, serial_no, section_label,
-         is_deleted, photo_path, page_no,
+         is_deleted, photo_path, page_image, page_no,
          score, matched_on
   from scored
   where score > 0 or trim(q_raw) = ''

@@ -63,6 +63,7 @@ export function toRow(e: Elector, part: PartMeta) {
     relation_name_skeleton: rel.skeleton || null,
     search_blob: blob,
     photo_path: e.photoPath,
+    page_image: e.pageImage,
     source_file: part.sourceFile,
     page_no: e.pageNo,
     box_no: e.boxNo,
@@ -91,7 +92,8 @@ export async function loadPart(part: PartMeta, electors: Elector[]) {
   if (partErr) throw new Error(`voter_parts: ${partErr.message}`);
 
   const rows = electors.map((e) => toRow(e, part));
-  const CHUNK = 500;
+  // 100 at a time, as asked — small enough to see exactly which slice failed.
+  const CHUNK = Number(process.env.LOAD_CHUNK ?? 100);
   for (let i = 0; i < rows.length; i += CHUNK) {
     const slice = rows.slice(i, i + CHUNK);
     const { error } = await supabase.from("voters").upsert(slice, { onConflict: "id" });

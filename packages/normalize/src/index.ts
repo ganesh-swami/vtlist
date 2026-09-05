@@ -16,6 +16,7 @@ export {
   normalizeDevanagari,
 } from "./devanagari.ts";
 export { latinToKey, latinToSkeleton, stripLatinHonorifics } from "./latin.ts";
+export { expandDevanagariAbbreviations, expandLatinAbbreviations } from "./abbrev.ts";
 
 import {
   detectScript,
@@ -24,6 +25,7 @@ import {
   normalizeDevanagari,
 } from "./devanagari.ts";
 import { latinToKey, latinToSkeleton, stripLatinHonorifics } from "./latin.ts";
+import { expandDevanagariAbbreviations, expandLatinAbbreviations } from "./abbrev.ts";
 
 /** The four forms of a name that get stored on (or compared against) a row. */
 export interface NameForms {
@@ -49,12 +51,16 @@ export function nameForms(input: string | null | undefined): NameForms {
 
   if (hasDevanagari(raw)) {
     const hi = normalizeDevanagari(raw);
-    const latin = devanagariToLatin(hi);
-    return { hi, latin, key: latinToKey(latin), skeleton: latinToSkeleton(latin) };
+    // `hi` stays exactly as printed; only the matching forms see the expansion,
+    // so "मो॰हनीफ" displays as the roll has it but is found by "Mohammad Hanif".
+    const latin = devanagariToLatin(expandDevanagariAbbreviations(hi));
+    const key = latinToKey(expandLatinAbbreviations(latin));
+    return { hi, latin: devanagariToLatin(hi), key, skeleton: latinToSkeleton(key) };
   }
 
   const latin = stripLatinHonorifics(raw).toLowerCase().replace(/\s+/g, " ");
-  return { hi: "", latin, key: latinToKey(latin), skeleton: latinToSkeleton(latin) };
+  const key = latinToKey(expandLatinAbbreviations(latin));
+  return { hi: "", latin, key, skeleton: latinToSkeleton(key) };
 }
 
 /** What a search box sends to the database. */

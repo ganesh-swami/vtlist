@@ -50,8 +50,11 @@ const OUT_DIR = path.join(ROOT, "data", "extracted");
 const CSV_DIR = path.join(ROOT, "data", "csv");
 const NAMES_DIR = path.join(ROOT, "data", "names");
 const SHEET_DIR = path.join(ROOT, "data", "sheets");
-const PHOTO_DIR = path.join(ROOT, "apps", "web", "public", "photos");
-const PAGE_DIR = path.join(ROOT, "apps", "web", "public", "pages");
+// Deliberately NOT under apps/web/public: files there are served by Next's
+// static handler before any auth code runs. They are streamed instead by
+// apps/web/app/api/image, which checks the session first.
+const PHOTO_DIR = path.join(ROOT, "data", "images", "photos");
+const PAGE_DIR = path.join(ROOT, "data", "images", "pages");
 const DEBUG_DIR = path.join(ROOT, "data", "debug");
 
 /** ~290 dpi. Photos are cut from this, so it wants to be generous. */
@@ -238,6 +241,11 @@ async function extractOne(file: string): Promise<ExtractedPart> {
   await mkdir(PHOTO_DIR, { recursive: true });
   await mkdir(DEBUG_DIR, { recursive: true });
 
+  // Whether a row carries a per-person photo is a fact about the filesystem,
+  // not about the flags of this particular run: part 3's crops already exist,
+  // and a later --no-photos rebuild must not blank their paths.
+  const existingPhotos = new Set(await readdir(PHOTO_DIR).catch(() => []));
+
   const electors = new Map<number, Elector>();
 
   await pool(pages, PAGE_CONCURRENCY, async (pg) => {
@@ -275,7 +283,7 @@ async function extractOne(file: string): Promise<ExtractedPart> {
     for (const box of pg.boxes) {
       if (box.serialNo === null) continue;
       merge(electors, box, typed, byserial.get(box.serialNo), pg, ward, partNo,
-        sectionFor(box.serialNo, sections), usePhotos);
+        sectionFor(box.serialNo, sections), existingPhotos);
     }
 
     process.stdout.write(`  page ${pg.pageNo}/${doc.numPages}\r`);
@@ -319,7 +327,7 @@ function merge(
   ward: string,
   partNo: string,
   heading: string | null,
-  usePhotos: boolean,
+  existingPhotos: Set<string>,
 ) {
   const serial = box.serialNo!;
   const id = `${ward}_${partNo}_${serial}`;
@@ -344,9 +352,9 @@ function merge(
     listType: box.epicNo ? "main" : "supplement",
     isDeleted: Boolean(box.deletionMark) || Boolean(prior?.isDeleted),
     deletionReason: deletionReason(box.deletionMark) ?? prior?.deletionReason ?? null,
-    // Only meaningful once the per-person crops have actually been made.
-    photoPath: usePhotos ? `/photos/${id}.jpg` : null,
-    pageImage: `/pages/${ward}_${partNo}_p${String(pg.pageNo).padStart(3, "0")}.jpg`,
+    // Only meaningful once the per-person crop actually exists on disk.
+    photoPath: existingPhotos.has(`${id}.jpg`) ? `/api/image/photos/${id}.jpg` : null,
+    pageImage: `/api/image/pages/${ward}_${partNo}_p${String(pg.pageNo).padStart(3, "0")}.jpg`,
     pageNo: prior?.pageNo ?? pg.pageNo,
     boxNo: prior?.boxNo ?? box.boxNo,
     raw: { textLayer: { fragments: box.fragments }, vision: seen ?? null },

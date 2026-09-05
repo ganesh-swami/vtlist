@@ -23,6 +23,7 @@ export interface VoterResult {
   section_label: string | null;
   is_deleted: boolean;
   photo_path: string | null;
+  page_image: string | null;
   page_no: number;
   score: number;
   matched_on: string;

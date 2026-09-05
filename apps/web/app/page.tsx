@@ -154,18 +154,22 @@ export default function Page() {
             className="bg-card flex gap-3 rounded-lg border p-3 shadow-sm"
             style={r.is_deleted ? { opacity: 0.65 } : undefined}
           >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={r.photo_path ?? ""}
-              alt=""
-              width={84}
-              height={104}
-              loading="lazy"
-              className="bg-muted h-[104px] w-[84px] shrink-0 rounded border object-cover"
-              onError={(e) => {
-                (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-              }}
-            />
+            {/* Only part 3 has per-person crops; everyone else gets a link to
+                the page scan instead, which is why this is conditional. */}
+            {r.photo_path && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={r.photo_path}
+                alt=""
+                width={84}
+                height={104}
+                loading="lazy"
+                className="bg-muted h-[104px] w-[84px] shrink-0 rounded border object-cover"
+                onError={(e) => {
+                  (e.currentTarget as HTMLImageElement).style.display = "none";
+                }}
+              />
+            )}
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline gap-2">
                 <span className="truncate text-lg font-medium">{r.name_hi ?? "—"}</span>
@@ -194,7 +198,19 @@ export default function Page() {
                   </>
                 )}
                 <br />
-                <span className="font-mono opacity-70">{r.id}</span>
+                {r.page_image ? (
+                  <a
+                    href={r.page_image}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono underline underline-offset-2 opacity-70 hover:opacity-100"
+                    title="मूल पृष्ठ देखें — open the roll page and zoom to this क्रम संख्या"
+                  >
+                    {r.id}
+                  </a>
+                ) : (
+                  <span className="font-mono opacity-70">{r.id}</span>
+                )}
                 <span className="opacity-70">
                   {" "}
                   · वार्ड {r.ward} · भाग {r.part_no} · क्रम {r.serial_no} · पृष्ठ {r.page_no}

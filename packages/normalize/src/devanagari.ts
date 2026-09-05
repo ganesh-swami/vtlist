@@ -159,8 +159,12 @@ export function normalizeDevanagari(input: string): string {
   // Devanagari digits -> ASCII digits.
   s = s.replace(/[\u0966-\u096F]/g, (d) => String(DEV_DIGITS.indexOf(d)));
 
-  // Danda, avagraha and ASCII punctuation are noise in a name field.
-  s = s.replace(/[\u0964\u0965\u093D\u0970\u0971.,;:'"`~!?()\[\]{}\/\|_*#@^&+=<>-]/g, " ");
+  // Strip only what is genuinely noise in a name field. The abbreviation sign
+  // (\u0970), the full stop and the slash are deliberately KEPT: this roll prints
+  // "\u092E\u094B\u0970\u0939\u0928\u0940\u092B", "\u092E\u094B.\u0907\u0915\u092C\u093E\u0932" and "\u090F\u0938/\u0913 \u0924\u093F\u0932\u094B\u0915\u091A\u0902\u0926", and the display value has to
+  // reproduce the page. They are handled on the way to the search key instead,
+  // where `expandDevanagariAbbreviations` splits and expands them.
+  s = s.replace(/[\u0964\u0965\u093D\u0971,;:'"`~!?()\[\]{}\|_*#@^&+=<>]/g, " ");
 
   s = s.replace(/\s+/g, " ").trim();
 
