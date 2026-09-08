@@ -504,7 +504,13 @@ export default function Page() {
           voter={dialogFor}
           parts={PARTS}
           onClose={() => setDialogOpen(false)}
-          onSaved={(id) => setDelivered((prev) => new Set(prev).add(id))}
+          onSaved={(ids) =>
+            setDelivered((prev) => {
+              const next = new Set(prev);
+              for (const id of ids) next.add(id);
+              return next;
+            })
+          }
         />
       )}
 

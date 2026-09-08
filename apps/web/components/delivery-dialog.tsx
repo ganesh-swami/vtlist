@@ -1,17 +1,22 @@
 "use client";
 
 /**
- * Recording that a voter has been handed their पर्ची.
+ * Recording that voters have been handed their पर्ची.
  *
- * Opens two ways, and the difference is only whether the voter is known yet:
- * from a search result the voter comes in already resolved, and from the
- * header button the dialog first asks for भाग संख्या and क्रमांक संख्या — the
- * two numbers printed on the slip itself — and looks the person up, so a
- * canvasser holding a counterfoil never has to search by name.
+ * Takes a list of भाग + क्रमांक rows rather than one, because slips are handed
+ * over a household at a time: the whole family shares an address, a mobile and
+ * whoever is bringing them, so typing those once and listing the क्रमांक is the
+ * shape the work actually has. A row added with + defaults to the भाग above
+ * it, since a household never straddles two.
  *
- * Every field below the voter is optional on purpose. The point is that
- * someone at a doorstep can tap once and move on; the address, mobile and
- * "कौन लाएगा" get filled in when they happen to be known.
+ * Opens two ways, differing only in whether the voter is known: from a search
+ * result the first row arrives filled and locked, and from the header button
+ * every row is typed — the two numbers printed on the slip itself, so someone
+ * holding a counterfoil never has to search by name.
+ *
+ * Every field below the क्रमांक list is optional on purpose, and "ढूंढें" is a
+ * way to check the numbers before committing, never a required step: saving
+ * resolves anything still unresolved on its own.
  */
 import { useEffect, useRef, useState } from "react";
 import type { VoterResult } from "@/utils/supabase/types";
@@ -22,12 +27,15 @@ export interface AddressOption {
   child: string;
 }
 
-export interface DeliveryDetails {
-  addressParent?: string;
-  addressChild?: string;
-  broughtBy?: string;
-  mobile?: string;
-  note?: string;
+interface Entry {
+  key: number;
+  part: string;
+  serial: string;
+  /** Filled once the numbers have been resolved to a real elector. */
+  voter: VoterResult | null;
+  error: string | null;
+  /** True for the row the dialog was opened on, which must not be edited. */
+  locked: boolean;
 }
 
 const RELATION_LABEL: Record<string, string> = {
@@ -80,12 +88,19 @@ export function DeliveryDialog({
   voter: VoterResult | null;
   parts: string[];
   onClose: () => void;
-  onSaved: (voterId: string) => void;
+  onSaved: (voterIds: string[]) => void;
 }) {
-  const [found, setFound] = useState<VoterResult | null>(voter);
-  const [part, setPart] = useState(voter?.part_no ?? parts[0] ?? "1");
-  const [serial, setSerial] = useState(voter ? String(voter.serial_no) : "");
-  const [looking, setLooking] = useState(false);
+  const nextKey = useRef(1);
+  const [entries, setEntries] = useState<Entry[]>(() => [
+    {
+      key: 0,
+      part: voter?.part_no ?? parts[0] ?? "1",
+      serial: voter ? String(voter.serial_no) : "",
+      voter,
+      error: null,
+      locked: !!voter,
+    },
+  ]);
 
   const [addresses, setAddresses] = useState<AddressOption[]>([]);
   const [addressParent, setAddressParent] = useState("");
@@ -94,9 +109,9 @@ export function DeliveryDialog({
   const [mobile, setMobile] = useState("");
   const [note, setNote] = useState("");
 
+  const [looking, setLooking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const serialRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     fetch("/api/addresses")
@@ -130,27 +145,60 @@ export function DeliveryDialog({
     ),
   ];
 
-  /** Resolve भाग + क्रमांक to a voter, or throw with a readable reason. */
-  async function resolve(): Promise<VoterResult> {
-    if (!serial.trim()) throw new Error("क्रमांक संख्या लिखें");
+  const patch = (key: number, changes: Partial<Entry>) =>
+    setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, ...changes } : e)));
+
+  function addRow() {
+    setEntries((prev) => [
+      ...prev,
+      {
+        key: nextKey.current++,
+        // Same भाग as the row above: a household never straddles two.
+        part: prev.at(-1)?.part ?? parts[0] ?? "1",
+        serial: "",
+        voter: null,
+        error: null,
+        locked: false,
+      },
+    ]);
+  }
+
+  const removeRow = (key: number) => setEntries((prev) => prev.filter((e) => e.key !== key));
+
+  /** Resolve one row's भाग + क्रमांक to a voter, or throw with a readable reason. */
+  async function resolveOne(entry: Entry): Promise<VoterResult> {
+    if (entry.voter) return entry.voter;
+    if (!entry.serial.trim()) throw new Error("क्रमांक संख्या लिखें");
     const res = await fetch(
-      `/api/voter-lookup?part=${encodeURIComponent(part)}&serial=${encodeURIComponent(serial.trim())}`,
+      `/api/voter-lookup?part=${encodeURIComponent(entry.part)}&serial=${encodeURIComponent(entry.serial.trim())}`,
     );
     const json = await res.json();
     if (!res.ok) throw new Error(json.error ?? "मतदाता नहीं मिला");
     return json.voter as VoterResult;
   }
 
-  /** The "ढूंढें" button — shows who the numbers belong to before saving. */
+  /** Resolve every filled row, recording each row's own outcome. */
+  async function resolveAll(): Promise<Entry[]> {
+    const filled = entries.filter((e) => e.serial.trim() || e.voter);
+    const settled = await Promise.all(
+      filled.map(async (e) => {
+        try {
+          return { ...e, voter: await resolveOne(e), error: null };
+        } catch (err) {
+          return { ...e, voter: null, error: (err as Error).message };
+        }
+      }),
+    );
+    setEntries((prev) => prev.map((e) => settled.find((s) => s.key === e.key) ?? e));
+    return settled;
+  }
+
   async function lookup() {
     setLooking(true);
     setError(null);
     try {
-      setFound(await resolve());
-    } catch (err) {
-      setFound(null);
-      setError((err as Error).message);
-      if (!serial.trim()) serialRef.current?.focus();
+      const settled = await resolveAll();
+      if (!settled.length) setError("कम से कम एक क्रमांक संख्या लिखें");
     } finally {
       setLooking(false);
     }
@@ -161,27 +209,49 @@ export function DeliveryDialog({
     setSaving(true);
     setError(null);
     try {
-      // "ढूंढें" is a convenience, not a step: someone who typed the two
-      // numbers and went straight for save gets the lookup done for them
-      // here, so a delivery is never lost to a button they did not press.
-      const voterRow = found ?? (await resolve());
-      if (!found) setFound(voterRow);
+      const settled = await resolveAll();
+      if (!settled.length) throw new Error("कम से कम एक क्रमांक संख्या लिखें");
 
-      const res = await fetch("/api/deliveries", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          voterId: voterRow.id,
-          addressParent,
-          addressChild,
-          broughtBy,
-          mobile,
-          note,
+      const ok = settled.filter((e) => e.voter);
+      const bad = settled.filter((e) => !e.voter);
+      if (!ok.length) throw new Error("कोई भी मतदाता नहीं मिला — क्रमांक जाँच लें");
+
+      // Every row shares the address, mobile and "कौन लाएगा" typed once above.
+      const results = await Promise.all(
+        ok.map(async (e) => {
+          const res = await fetch("/api/deliveries", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              voterId: e.voter!.id,
+              addressParent,
+              addressChild,
+              broughtBy,
+              mobile,
+              note,
+            }),
+          });
+          return { entry: e, ok: res.ok };
         }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "सेव नहीं हुआ");
-      onSaved(voterRow.id);
+      );
+
+      const saved = results.filter((r) => r.ok).map((r) => r.entry.voter!.id);
+      if (saved.length) onSaved(saved);
+
+      const failed = results.filter((r) => !r.ok).map((r) => r.entry);
+      if (failed.length || bad.length) {
+        // Keep the dialog open showing exactly which क्रमांक still need
+        // attention, rather than closing on a partial success.
+        setEntries((prev) =>
+          prev.map((e) =>
+            failed.some((f) => f.key === e.key) ? { ...e, error: "सेव नहीं हुआ" } : e,
+          ),
+        );
+        setError(
+          `${saved.length} सेव हुए, ${failed.length + bad.length} रह गए — नीचे लाल निशान देखें`,
+        );
+        return;
+      }
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -189,6 +259,9 @@ export function DeliveryDialog({
       setSaving(false);
     }
   }
+
+  const resolved = entries.filter((e) => e.voter);
+  const anyTyped = entries.some((e) => e.serial.trim() || e.voter);
 
   return (
     <div
@@ -214,80 +287,96 @@ export function DeliveryDialog({
           </button>
         </div>
 
-        <div className="mt-4 grid grid-cols-[7rem_1fr] gap-2">
-          <div>
-            <label className="mb-1 block text-xs font-medium">भाग संख्या</label>
-            <select
-              value={part}
-              onChange={(e) => {
-                setPart(e.target.value);
-                setFound(null);
-              }}
-              disabled={!!voter}
-              className={`${FIELD} disabled:opacity-60`}
-            >
-              {parts.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </select>
+        <p className="text-muted-foreground mt-1 text-xs">
+          एक साथ कई मतदाता जोड़ सकते हैं — नीचे + दबाएँ
+        </p>
+
+        <div className="mt-3 space-y-2">
+          <div className="text-muted-foreground grid grid-cols-[7rem_1fr_2rem] gap-2 text-xs font-medium">
+            <span>भाग संख्या</span>
+            <span>क्रमांक संख्या</span>
+            <span />
           </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium">क्रमांक संख्या</label>
-            <div className="flex gap-2">
-              <input
-                ref={serialRef}
-                value={serial}
-                inputMode="numeric"
-                onChange={(e) => {
-                  setSerial(e.target.value);
-                  setFound(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void lookup(); // show who it is; Enter is a peek, not a commit
-                  }
-                }}
-                disabled={!!voter}
-                placeholder="जैसे 763"
-                className={`${FIELD} disabled:opacity-60`}
-                autoComplete="off"
-              />
-              {!voter && (
-                <button
-                  onClick={() => void lookup()}
-                  disabled={looking}
-                  className="bg-secondary text-secondary-foreground shrink-0 rounded-md border px-3 text-sm disabled:opacity-60"
+
+          {entries.map((e) => (
+            <div key={e.key}>
+              <div className="grid grid-cols-[7rem_1fr_2rem] items-center gap-2">
+                <select
+                  value={e.part}
+                  onChange={(ev) => patch(e.key, { part: ev.target.value, voter: null, error: null })}
+                  disabled={e.locked}
+                  className={`${FIELD} disabled:opacity-60`}
                 >
-                  {looking ? "…" : "ढूंढें"}
-                </button>
+                  {parts.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  value={e.serial}
+                  inputMode="numeric"
+                  onChange={(ev) => patch(e.key, { serial: ev.target.value, voter: null, error: null })}
+                  onKeyDown={(ev) => {
+                    if (ev.key === "Enter") {
+                      ev.preventDefault();
+                      addRow();
+                    }
+                  }}
+                  disabled={e.locked}
+                  placeholder="जैसे 763"
+                  className={`${FIELD} disabled:opacity-60 ${e.error ? "border-red-500" : ""}`}
+                  autoComplete="off"
+                />
+                {entries.length > 1 && !e.locked ? (
+                  <button
+                    onClick={() => removeRow(e.key)}
+                    aria-label="यह पंक्ति हटाएँ"
+                    className="text-muted-foreground hover:text-foreground hover:bg-muted flex h-8 w-8 items-center justify-center rounded-md border text-base leading-none"
+                  >
+                    ×
+                  </button>
+                ) : (
+                  <span />
+                )}
+              </div>
+
+              {e.voter && (
+                <div className="text-muted-foreground mt-1 pl-1 text-xs">
+                  ✓ <span className="text-foreground font-medium">{e.voter.name_hi ?? "—"}</span>
+                  {" · "}
+                  {RELATION_LABEL[e.voter.relation_type ?? "other"]}: {e.voter.relation_name_hi ?? "—"}
+                  {e.voter.age != null && <> · आयु {e.voter.age}</>}
+                </div>
               )}
+              {e.error && <div className="mt-1 pl-1 text-xs text-red-600">{e.error}</div>}
             </div>
+          ))}
+
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={addRow}
+              className="border-primary/60 text-primary hover:bg-primary/5 flex-1 rounded-md border border-dashed px-3 py-2 text-sm font-medium"
+            >
+              + और जोड़ें
+            </button>
+            <button
+              onClick={() => void lookup()}
+              disabled={looking || !anyTyped}
+              className="bg-secondary text-secondary-foreground rounded-md border px-3 py-2 text-sm disabled:opacity-60"
+            >
+              {looking ? "…" : "ढूंढें"}
+            </button>
           </div>
         </div>
 
-        {found && (
-          <div className="bg-muted/50 mt-3 rounded-md border p-3 text-sm">
-            <div className="font-medium">{found.name_hi ?? "—"}</div>
-            <div className="text-muted-foreground text-xs">
-              {RELATION_LABEL[found.relation_type ?? "other"]} का नाम: {found.relation_name_hi ?? "—"}
-              {found.age != null && <> · आयु {found.age}</>}
-            </div>
-            <div className="text-muted-foreground mt-0.5 text-xs">
-              भाग <span className="text-foreground font-bold">{found.part_no}</span> · क्रम{" "}
-              <span className="text-foreground font-bold">{found.serial_no}</span>
-              {found.epic_no && <> · {found.epic_no}</>}
-            </div>
-          </div>
-        )}
+        <div className="mt-4 space-y-3 border-t pt-4">
+          <p className="text-muted-foreground text-xs">
+            नीचे की जानकारी ऊपर के सभी मतदाताओं पर लागू होगी — सब वैकल्पिक है
+          </p>
 
-        <div className="mt-4 space-y-3">
           <div>
-            <label className="mb-1 block text-xs font-medium">
-              पता — मोहल्ला / कॉलोनी <span className="text-muted-foreground">(वैकल्पिक)</span>
-            </label>
+            <label className="mb-1 block text-xs font-medium">पता — मोहल्ला / कॉलोनी</label>
             <Suggest
               id="address-parent"
               value={addressParent}
@@ -298,9 +387,7 @@ export function DeliveryDialog({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium">
-              पता — गली / मकान <span className="text-muted-foreground">(वैकल्पिक)</span>
-            </label>
+            <label className="mb-1 block text-xs font-medium">पता — गली / मकान</label>
             <Suggest
               id="address-child"
               value={addressChild}
@@ -311,9 +398,7 @@ export function DeliveryDialog({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium">
-              कौन लाएगा <span className="text-muted-foreground">(वैकल्पिक)</span>
-            </label>
+            <label className="mb-1 block text-xs font-medium">कौन लाएगा</label>
             <input
               value={broughtBy}
               onChange={(e) => setBroughtBy(e.target.value)}
@@ -324,9 +409,7 @@ export function DeliveryDialog({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium">
-              मोबाइल नंबर <span className="text-muted-foreground">(वैकल्पिक)</span>
-            </label>
+            <label className="mb-1 block text-xs font-medium">मोबाइल नंबर</label>
             <input
               value={mobile}
               onChange={(e) => setMobile(e.target.value)}
@@ -338,9 +421,7 @@ export function DeliveryDialog({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium">
-              टिप्पणी <span className="text-muted-foreground">(वैकल्पिक)</span>
-            </label>
+            <label className="mb-1 block text-xs font-medium">टिप्पणी</label>
             <input
               value={note}
               onChange={(e) => setNote(e.target.value)}
@@ -366,17 +447,14 @@ export function DeliveryDialog({
           </button>
           <button
             onClick={() => void save()}
-            disabled={saving || (!found && !serial.trim())}
+            disabled={saving || !anyTyped}
             className="flex-1 rounded-md bg-green-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
-            {saving ? "सेव हो रहा है…" : "दे दी — सेव करें"}
+            {saving
+              ? "सेव हो रहा है…"
+              : `दे दी — सेव करें${resolved.length > 1 ? ` (${resolved.length})` : ""}`}
           </button>
         </div>
-        {!found && (
-          <p className="text-muted-foreground mt-2 text-center text-xs">
-            भाग और क्रमांक भरकर सीधे सेव कर सकते हैं — &quot;ढूंढें&quot; ज़रूरी नहीं
-          </p>
-        )}
       </div>
     </div>
   );
