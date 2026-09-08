@@ -47,7 +47,14 @@ export default function Page() {
   const [relation, setRelation] = useState("");
   const [gender, setGender] = useState("");
   const [part, setPart] = useState("");
+  const [address, setAddress] = useState("");
   const [showFilters, setShowFilters] = useState(false);
+
+  // The localities slips have actually been handed out at, so a canvasser can
+  // pull up a street again without remembering a single name.
+  const [addressOptions, setAddressOptions] = useState<
+    { id: string; parent: string; child: string }[]
+  >([]);
 
   const [results, setResults] = useState<Result[]>([]);
   const [loading, setLoading] = useState(false);
@@ -114,6 +121,16 @@ export default function Page() {
   useEffect(() => {
     void refreshDelivered(results);
   }, [results, refreshDelivered]);
+
+  // Re-read each time the panel is opened, so an address added five minutes
+  // ago in the delivery dialog is there to filter by now.
+  useEffect(() => {
+    if (!showFilters) return;
+    fetch("/api/addresses")
+      .then((r) => r.json())
+      .then((j) => setAddressOptions(j.addresses ?? []))
+      .catch(() => setAddressOptions([]));
+  }, [showFilters]);
 
   /**
    * Mark straight from the result card — no dialog.
@@ -224,6 +241,7 @@ export default function Page() {
     if (relation.trim()) params.set("relation", relation.trim());
     if (gender) params.set("gender", gender);
     if (part.trim()) params.set("part", part.trim());
+    if (address) params.set("address", address);
     const query = params.toString();
 
     if (!query) {
@@ -390,6 +408,18 @@ export default function Page() {
               className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none"
               {...PASTE_FRIENDLY}
             />
+            <select
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none sm:col-span-3"
+            >
+              <option value="">पता — सभी (जिन्हें पर्ची दी गई)</option>
+              {addressOptions.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.child ? `${a.parent} — ${a.child}` : a.parent}
+                </option>
+              ))}
+            </select>
           </div>
         )}
       </div>
