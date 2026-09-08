@@ -130,37 +130,48 @@ export function DeliveryDialog({
     ),
   ];
 
+  /** Resolve भाग + क्रमांक to a voter, or throw with a readable reason. */
+  async function resolve(): Promise<VoterResult> {
+    if (!serial.trim()) throw new Error("क्रमांक संख्या लिखें");
+    const res = await fetch(
+      `/api/voter-lookup?part=${encodeURIComponent(part)}&serial=${encodeURIComponent(serial.trim())}`,
+    );
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error ?? "मतदाता नहीं मिला");
+    return json.voter as VoterResult;
+  }
+
+  /** The "ढूंढें" button — shows who the numbers belong to before saving. */
   async function lookup() {
-    if (!serial.trim()) {
-      setError("क्रमांक संख्या लिखें");
-      serialRef.current?.focus();
-      return;
-    }
     setLooking(true);
     setError(null);
     try {
-      const res = await fetch(`/api/voter-lookup?part=${encodeURIComponent(part)}&serial=${encodeURIComponent(serial.trim())}`);
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "voter नहीं मिला");
-      setFound(json.voter);
+      setFound(await resolve());
     } catch (err) {
       setFound(null);
       setError((err as Error).message);
+      if (!serial.trim()) serialRef.current?.focus();
     } finally {
       setLooking(false);
     }
   }
 
   async function save() {
-    if (!found || saving) return;
+    if (saving) return;
     setSaving(true);
     setError(null);
     try {
+      // "ढूंढें" is a convenience, not a step: someone who typed the two
+      // numbers and went straight for save gets the lookup done for them
+      // here, so a delivery is never lost to a button they did not press.
+      const voterRow = found ?? (await resolve());
+      if (!found) setFound(voterRow);
+
       const res = await fetch("/api/deliveries", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          voterId: found.id,
+          voterId: voterRow.id,
           addressParent,
           addressChild,
           broughtBy,
@@ -170,7 +181,7 @@ export function DeliveryDialog({
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "सेव नहीं हुआ");
-      onSaved(found.id);
+      onSaved(voterRow.id);
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -236,7 +247,7 @@ export function DeliveryDialog({
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {
                     e.preventDefault();
-                    void lookup();
+                    void lookup(); // show who it is; Enter is a peek, not a commit
                   }
                 }}
                 disabled={!!voter}
@@ -355,7 +366,7 @@ export function DeliveryDialog({
           </button>
           <button
             onClick={() => void save()}
-            disabled={!found || saving}
+            disabled={saving || (!found && !serial.trim())}
             className="flex-1 rounded-md bg-green-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
             {saving ? "सेव हो रहा है…" : "दे दी — सेव करें"}
@@ -363,7 +374,7 @@ export function DeliveryDialog({
         </div>
         {!found && (
           <p className="text-muted-foreground mt-2 text-center text-xs">
-            पहले भाग और क्रमांक से मतदाता ढूंढें
+            भाग और क्रमांक भरकर सीधे सेव कर सकते हैं — &quot;ढूंढें&quot; ज़रूरी नहीं
           </p>
         )}
       </div>
