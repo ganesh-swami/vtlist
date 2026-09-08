@@ -15,11 +15,15 @@
  * same fuzzy pipeline as a name was exactly the mixing that once made it not
  * work reliably.
  */
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { createClient } from "@/utils/supabase/client";
 import { VoterModal } from "@/components/voter-modal";
+import { DeliveryDialog } from "@/components/delivery-dialog";
 import type { VoterResult as Result } from "@/utils/supabase/types";
+
+/** The भाग numbers this ward is split into. */
+const PARTS = ["1", "2", "3", "4"];
 
 const RELATION_LABEL: Record<string, string> = {
   father: "पिता",
@@ -58,6 +62,50 @@ export default function Page() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [printing, setPrinting] = useState(false);
   const [printError, setPrintError] = useState<string | null>(null);
+
+  // Who has already been handed a पर्ची. Server-backed, so the green tick is
+  // still there tomorrow, on another phone, for whoever is canvassing next —
+  // the whole point of tracking it. Refreshed for whatever is on screen.
+  const [delivered, setDelivered] = useState<Set<string>>(new Set());
+  const [dialogFor, setDialogFor] = useState<Result | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+
+  const refreshDelivered = useCallback(async (rows: Result[]) => {
+    if (!rows.length) return;
+    try {
+      const res = await fetch(`/api/deliveries?ids=${rows.map((r) => r.id).join(",")}`);
+      const json = await res.json();
+      const ids: string[] = (json.deliveries ?? []).map((d: { voter_id: string }) => d.voter_id);
+      setDelivered((prev) => {
+        const next = new Set(prev);
+        // Only the rows we just asked about are authoritative here: a voter
+        // absent from this answer was not delivered, even if an earlier
+        // search had marked them.
+        for (const r of rows) next.delete(r.id);
+        for (const id of ids) next.add(id);
+        return next;
+      });
+    } catch {
+      // A failed status check must not blank the list that is already useful.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDelivered(results);
+  }, [results, refreshDelivered]);
+
+  async function unmarkDelivered(id: string) {
+    setDelivered((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    try {
+      await fetch(`/api/deliveries?voterId=${encodeURIComponent(id)}`, { method: "DELETE" });
+    } catch {
+      setDelivered((prev) => new Set(prev).add(id)); // put it back
+    }
+  }
 
   function toggleSelect(id: string) {
     setSelectedIds((prev) => {
@@ -214,6 +262,15 @@ export default function Page() {
           >
             {selectMode ? "चयन बंद करें" : "प्रिंट के लिए चुनें"}
           </button>
+          <button
+            onClick={() => {
+              setDialogFor(null);
+              setDialogOpen(true);
+            }}
+            className="rounded-md border border-green-600 px-2 py-0.5 font-medium text-green-700 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-950/40"
+          >
+            पर्ची दे दी
+          </button>
           {!loading && searched && (
             <span className="text-muted-foreground">{results.length} परिणाम</span>
           )}
@@ -283,7 +340,11 @@ export default function Page() {
             }}
             role="button"
             tabIndex={0}
-            className="bg-card hover:border-primary/50 flex cursor-pointer gap-3 rounded-lg border p-3 shadow-sm transition-colors"
+            className={`bg-card flex cursor-pointer gap-3 rounded-lg p-3 shadow-sm transition-colors ${
+              delivered.has(r.id)
+                ? "border-2 border-green-600 dark:border-green-500"
+                : "hover:border-primary/50 border"
+            }`}
             style={r.is_deleted ? { opacity: 0.65 } : undefined}
           >
             {selectMode && (
@@ -316,6 +377,14 @@ export default function Page() {
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline gap-2">
                 <span className="truncate text-lg font-medium">{r.name_hi ?? "—"}</span>
+                {delivered.has(r.id) && (
+                  <span
+                    title="पर्ची दे दी गई"
+                    className="shrink-0 rounded bg-green-600 px-1.5 py-0.5 text-[10px] font-medium text-white"
+                  >
+                    ✓ दे दी
+                  </span>
+                )}
                 {r.is_deleted && (
                   <span className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700 dark:bg-red-950 dark:text-red-300">
                     विलोपित
@@ -350,12 +419,42 @@ export default function Page() {
                   {r.section_label}
                 </div>
               )}
+
+              <div className="mt-2 flex gap-2" onClick={(e) => e.stopPropagation()}>
+                {delivered.has(r.id) ? (
+                  <button
+                    onClick={() => void unmarkDelivered(r.id)}
+                    className="text-muted-foreground hover:text-foreground rounded border px-2 py-1 text-xs"
+                  >
+                    दे दी हटाएँ
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => {
+                      setDialogFor(r);
+                      setDialogOpen(true);
+                    }}
+                    className="rounded border border-green-600 px-2 py-1 text-xs font-medium text-green-700 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-950/40"
+                  >
+                    दे दी
+                  </button>
+                )}
+              </div>
             </div>
           </li>
         ))}
       </ul>
 
       {selected && <VoterModal voter={selected} onClose={() => setSelected(null)} />}
+
+      {dialogOpen && (
+        <DeliveryDialog
+          voter={dialogFor}
+          parts={PARTS}
+          onClose={() => setDialogOpen(false)}
+          onSaved={(id) => setDelivered((prev) => new Set(prev).add(id))}
+        />
+      )}
 
       {selectedIds.size > 0 && (
         <div className="bg-card fixed inset-x-0 bottom-4 z-20 mx-auto flex w-fit items-center gap-3 rounded-full border px-4 py-2 shadow-lg">
