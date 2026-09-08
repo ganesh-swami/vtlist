@@ -69,6 +69,7 @@ export default function Page() {
   const [delivered, setDelivered] = useState<Set<string>>(new Set());
   const [dialogFor, setDialogFor] = useState<Result | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [deliverError, setDeliverError] = useState<string | null>(null);
 
   const refreshDelivered = useCallback(async (rows: Result[]) => {
     if (!rows.length) return;
@@ -94,16 +95,54 @@ export default function Page() {
     void refreshDelivered(results);
   }, [results, refreshDelivered]);
 
+  /**
+   * Mark straight from the result card — no dialog.
+   *
+   * The voter is already identified by the row that was tapped, and every
+   * other field is optional, so asking anything more would be a form standing
+   * between a canvasser and the next doorstep. Details can still be added
+   * afterwards through the header's पर्ची दे दी dialog, which upserts the
+   * same row. The tick flips immediately and rolls back only if the write
+   * actually fails.
+   */
+  async function markDelivered(id: string) {
+    setDelivered((prev) => new Set(prev).add(id));
+    setDeliverError(null);
+    try {
+      const res = await fetch("/api/deliveries", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voterId: id }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error ?? `सेव नहीं हुआ (${res.status})`);
+      }
+    } catch (err) {
+      setDelivered((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      setDeliverError((err as Error).message);
+    }
+  }
+
   async function unmarkDelivered(id: string) {
     setDelivered((prev) => {
       const next = new Set(prev);
       next.delete(id);
       return next;
     });
+    setDeliverError(null);
     try {
-      await fetch(`/api/deliveries?voterId=${encodeURIComponent(id)}`, { method: "DELETE" });
-    } catch {
+      const res = await fetch(`/api/deliveries?voterId=${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("हटा नहीं सका");
+    } catch (err) {
       setDelivered((prev) => new Set(prev).add(id)); // put it back
+      setDeliverError((err as Error).message);
     }
   }
 
@@ -314,6 +353,12 @@ export default function Page() {
         </p>
       )}
 
+      {deliverError && (
+        <p className="mt-4 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+          {deliverError}
+        </p>
+      )}
+
       {!searched && !loading && (
         <p className="text-muted-foreground mt-16 text-center text-sm">
           नाम या EPIC नंबर लिखकर &quot;खोजें&quot; दबाएँ — enter a name or EPIC number and press Search
@@ -430,15 +475,22 @@ export default function Page() {
                   </button>
                 ) : (
                   <button
-                    onClick={() => {
-                      setDialogFor(r);
-                      setDialogOpen(true);
-                    }}
+                    onClick={() => void markDelivered(r.id)}
                     className="rounded border border-green-600 px-2 py-1 text-xs font-medium text-green-700 hover:bg-green-50 dark:text-green-400 dark:hover:bg-green-950/40"
                   >
                     दे दी
                   </button>
                 )}
+                <button
+                  onClick={() => {
+                    setDialogFor(r);
+                    setDialogOpen(true);
+                  }}
+                  className="text-muted-foreground hover:text-foreground rounded border px-2 py-1 text-xs"
+                  title="पता, मोबाइल, कौन लाएगा"
+                >
+                  विवरण
+                </button>
               </div>
             </div>
           </li>
