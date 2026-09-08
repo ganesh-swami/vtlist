@@ -177,8 +177,17 @@ export function DeliveryDialog({
     return json.voter as VoterResult;
   }
 
-  /** Resolve every filled row, recording each row's own outcome. */
-  async function resolveAll(): Promise<Entry[]> {
+  /**
+   * Resolve every filled row.
+   *
+   * `showNames` is what separates the two buttons. "ढूंढें" exists precisely to
+   * show who the numbers belong to, so it writes the resolved voter back into
+   * the row. Save does not: it just saves, and putting a list of names on
+   * screen in the moment before the dialog closes is noise, not confirmation.
+   * Either way a row that failed keeps its own reason, because that is the one
+   * thing the user still has to act on.
+   */
+  async function resolveAll(showNames: boolean): Promise<Entry[]> {
     const filled = entries.filter((e) => e.serial.trim() || e.voter);
     const settled = await Promise.all(
       filled.map(async (e) => {
@@ -189,7 +198,13 @@ export function DeliveryDialog({
         }
       }),
     );
-    setEntries((prev) => prev.map((e) => settled.find((s) => s.key === e.key) ?? e));
+    setEntries((prev) =>
+      prev.map((e) => {
+        const s = settled.find((x) => x.key === e.key);
+        if (!s) return e;
+        return showNames ? s : { ...e, error: s.error };
+      }),
+    );
     return settled;
   }
 
@@ -197,7 +212,7 @@ export function DeliveryDialog({
     setLooking(true);
     setError(null);
     try {
-      const settled = await resolveAll();
+      const settled = await resolveAll(true);
       if (!settled.length) setError("कम से कम एक क्रमांक संख्या लिखें");
     } finally {
       setLooking(false);
@@ -209,7 +224,7 @@ export function DeliveryDialog({
     setSaving(true);
     setError(null);
     try {
-      const settled = await resolveAll();
+      const settled = await resolveAll(false);
       if (!settled.length) throw new Error("कम से कम एक क्रमांक संख्या लिखें");
 
       const ok = settled.filter((e) => e.voter);
@@ -260,8 +275,11 @@ export function DeliveryDialog({
     }
   }
 
-  const resolved = entries.filter((e) => e.voter);
-  const anyTyped = entries.some((e) => e.serial.trim() || e.voter);
+  // Counted from what has been typed, not from what has been looked up —
+  // the button has to be honest about how many it will save even when
+  // "ढूंढें" was never pressed.
+  const filledCount = entries.filter((e) => e.serial.trim() || e.voter).length;
+  const anyTyped = filledCount > 0;
 
   return (
     <div
@@ -452,7 +470,7 @@ export function DeliveryDialog({
           >
             {saving
               ? "सेव हो रहा है…"
-              : `दे दी — सेव करें${resolved.length > 1 ? ` (${resolved.length})` : ""}`}
+              : `दे दी — सेव करें${filledCount > 1 ? ` (${filledCount})` : ""}`}
           </button>
         </div>
       </div>
