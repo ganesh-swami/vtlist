@@ -71,6 +71,26 @@ export default function Page() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [deliverError, setDeliverError] = useState<string | null>(null);
 
+  // The running total, fetched only when asked for. It is a whole-table count
+  // and nobody needs it on the way to looking someone up.
+  const [total, setTotal] = useState<number | null>(null);
+  const [counting, setCounting] = useState(false);
+
+  async function showTotal() {
+    setCounting(true);
+    setDeliverError(null);
+    try {
+      const res = await fetch("/api/deliveries?count=1");
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "गिनती नहीं मिली");
+      setTotal(json.total);
+    } catch (err) {
+      setDeliverError((err as Error).message);
+    } finally {
+      setCounting(false);
+    }
+  }
+
   const refreshDelivered = useCallback(async (rows: Result[]) => {
     if (!rows.length) return;
     try {
@@ -106,7 +126,10 @@ export default function Page() {
    * actually fails.
    */
   async function markDelivered(id: string) {
+    if (delivered.has(id)) return;
     setDelivered((prev) => new Set(prev).add(id));
+    // Keep a total already on screen in step, rather than letting it go stale.
+    setTotal((t) => (t == null ? t : t + 1));
     setDeliverError(null);
     try {
       const res = await fetch("/api/deliveries", {
@@ -124,6 +147,7 @@ export default function Page() {
         next.delete(id);
         return next;
       });
+      setTotal((t) => (t == null ? t : t - 1));
       setDeliverError((err as Error).message);
     }
   }
@@ -134,6 +158,7 @@ export default function Page() {
       next.delete(id);
       return next;
     });
+    setTotal((t) => (t == null ? t : t - 1));
     setDeliverError(null);
     try {
       const res = await fetch(`/api/deliveries?voterId=${encodeURIComponent(id)}`, {
@@ -142,6 +167,7 @@ export default function Page() {
       if (!res.ok) throw new Error("हटा नहीं सका");
     } catch (err) {
       setDelivered((prev) => new Set(prev).add(id)); // put it back
+      setTotal((t) => (t == null ? t : t + 1));
       setDeliverError((err as Error).message);
     }
   }
@@ -310,6 +336,27 @@ export default function Page() {
           >
             पर्ची दे दी
           </button>
+          {total == null ? (
+            <button
+              onClick={() => void showTotal()}
+              disabled={counting}
+              className="text-muted-foreground hover:text-foreground underline-offset-4 hover:underline disabled:opacity-60"
+            >
+              {counting ? "गिन रहे हैं…" : "कितनी दे दी?"}
+            </button>
+          ) : (
+            <span className="rounded-md border border-green-600 bg-green-50 px-2 py-0.5 font-medium text-green-800 dark:bg-green-950/40 dark:text-green-300">
+              कुल {total} पर्ची दी गईं
+              <button
+                onClick={() => void showTotal()}
+                disabled={counting}
+                title="फिर से गिनें"
+                className="ml-1.5 opacity-60 hover:opacity-100"
+              >
+                ↻
+              </button>
+            </span>
+          )}
           {!loading && searched && (
             <span className="text-muted-foreground">{results.length} परिणाम</span>
           )}

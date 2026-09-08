@@ -30,7 +30,20 @@ export async function GET(request: Request) {
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "not signed in", deliveries: [] }, { status: 401 });
 
-  const ids = (new URL(request.url).searchParams.get("ids") ?? "")
+  const params = new URL(request.url).searchParams;
+
+  // How many slips have gone out in total. Asked for explicitly rather than
+  // sent with every search, because it is a whole-table count and nobody
+  // needs it on the way to looking someone up.
+  if (params.get("count")) {
+    const { count, error } = await supabase
+      .from("deliveries")
+      .select("*", { count: "exact", head: true });
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ total: count ?? 0 });
+  }
+
+  const ids = (params.get("ids") ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
