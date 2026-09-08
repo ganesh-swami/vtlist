@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "build": "turbo build",
-    "dev": "turbo dev",
+    "dev": "node api.js && turbo dev",
     "lint": "turbo lint",
     "format": "turbo format",
     "typecheck": "turbo typecheck",
