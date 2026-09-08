@@ -50,11 +50,10 @@ export default function Page() {
   const [address, setAddress] = useState("");
   const [showFilters, setShowFilters] = useState(false);
 
-  // The localities slips have actually been handed out at, so a canvasser can
-  // pull up a street again without remembering a single name.
-  const [addressOptions, setAddressOptions] = useState<
-    { id: string; parent: string; child: string }[]
-  >([]);
+  // Suggestions for the address box: the मोहल्ला headings printed on the roll
+  // (every elector has one) plus the addresses typed while handing out slips.
+  // They are only hints — anything at all can be typed in the box.
+  const [addressOptions, setAddressOptions] = useState<string[]>([]);
 
   const [results, setResults] = useState<Result[]>([]);
   const [loading, setLoading] = useState(false);
@@ -128,7 +127,12 @@ export default function Page() {
     if (!showFilters) return;
     fetch("/api/addresses")
       .then((r) => r.json())
-      .then((j) => setAddressOptions(j.addresses ?? []))
+      .then((j) => {
+        const fromDeliveries: string[] = (j.addresses ?? []).flatMap(
+          (a: { parent: string; child: string }) => [a.parent, a.child].filter(Boolean),
+        );
+        setAddressOptions([...new Set([...(j.sections ?? []), ...fromDeliveries])].sort());
+      })
       .catch(() => setAddressOptions([]));
   }, [showFilters]);
 
@@ -241,7 +245,7 @@ export default function Page() {
     if (relation.trim()) params.set("relation", relation.trim());
     if (gender) params.set("gender", gender);
     if (part.trim()) params.set("part", part.trim());
-    if (address) params.set("address", address);
+    if (address.trim()) params.set("address", address.trim());
     const query = params.toString();
 
     if (!query) {
@@ -408,18 +412,20 @@ export default function Page() {
               className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none"
               {...PASTE_FRIENDLY}
             />
-            <select
+            <input
+              list="address-filter-options"
               value={address}
               onChange={(e) => setAddress(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder="पता / मोहल्ला / गली — कुछ भी लिखें"
               className="border-input bg-background rounded-md border px-3 py-2 text-sm outline-none sm:col-span-3"
-            >
-              <option value="">पता — सभी (जिन्हें पर्ची दी गई)</option>
+              {...PASTE_FRIENDLY}
+            />
+            <datalist id="address-filter-options">
               {addressOptions.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.child ? `${a.parent} — ${a.child}` : a.parent}
-                </option>
+                <option key={a} value={a} />
               ))}
-            </select>
+            </datalist>
           </div>
         )}
       </div>

@@ -59,40 +59,65 @@ export async function GET(request: Request) {
     return NextResponse.json({ results: [], total: 0 });
   }
 
-  // Filtering by address means "whoever was handed a slip here", which lives in
-  // `deliveries`, not on the roll — the roll's own section_label is what the
-  // printed page says and is a different thing entirely. One address is a
-  // street or a household, so this id set stays small.
+  // An address is free text matched against two different things, because
+  // they answer different questions: the मोहल्ला printed on the roll, which
+  // every elector has, and the address typed while handing out a slip, which
+  // only the delivered ones have. Searching either alone would miss half the
+  // ward, so a voter counts if the text matches on either side.
   let atAddress: string[] | null = null;
   if (address) {
-    const { data, error } = await supabase
-      .from("deliveries")
-      .select("voter_id")
-      .eq("address_id", address)
-      .returns<{ voter_id: string }[]>();
-    if (error) return NextResponse.json({ error: error.message, results: [] }, { status: 500 });
-    atAddress = (data ?? []).map((d) => d.voter_id);
+    const like = `%${address}%`;
+
+    const [byDelivery, bySection] = await Promise.all([
+      supabase
+        .from("deliveries")
+        .select("voter_id, addresses!inner(parent, child)")
+        .or(`parent.ilike.${like},child.ilike.${like}`, { referencedTable: "addresses" })
+        .returns<{ voter_id: string }[]>(),
+      supabase
+        .from("voters")
+        .select("id")
+        .ilike("section_label", like)
+        .returns<{ id: string }[]>(),
+    ]);
+
+    if (byDelivery.error) {
+      return NextResponse.json({ error: byDelivery.error.message, results: [] }, { status: 500 });
+    }
+    if (bySection.error) {
+      return NextResponse.json({ error: bySection.error.message, results: [] }, { status: 500 });
+    }
+
+    atAddress = [
+      ...new Set([
+        ...(byDelivery.data ?? []).map((d) => d.voter_id),
+        ...(bySection.data ?? []).map((v) => v.id),
+      ]),
+    ];
     if (!atAddress.length) return NextResponse.json({ results: [], page, hasMore: false });
   }
 
-  // An address on its own is a browse, not a search: return everyone recorded
-  // there, in roll order, rather than pushing an empty query through the
-  // fuzzy-matching function, which would score every row zero and drop them.
+  // An address on its own is a browse, not a search: return everyone there in
+  // roll order, rather than pushing an empty query through the fuzzy-matching
+  // function, which would score every row zero and drop them. A whole मोहल्ला
+  // can run to hundreds of electors, so this pages like any other result set.
   if (atAddress && !q && !relation && !epic && !gender && !part && !ageMin && !ageMax) {
+    const slice = atAddress.slice(page * limit, page * limit + limit);
     const { data, error } = await supabase
       .from("voters")
       .select(
         "id, name_hi, name_latin, relation_type, relation_name_hi, relation_name_latin, house_no, age, gender, epic_no, ward, part_no, serial_no, section_label, is_deleted, photo_path, page_image, page_no",
       )
-      .in("id", atAddress)
+      .in("id", slice)
       .order("part_no", { ascending: true })
       .order("serial_no", { ascending: true })
       .returns<Omit<VoterResult, "score" | "matched_on">[]>();
     if (error) return NextResponse.json({ error: error.message, results: [] }, { status: 500 });
     return NextResponse.json({
       results: (data ?? []).map((v) => ({ ...v, score: 1, matched_on: "address" })),
-      page: 0,
-      hasMore: false,
+      page,
+      hasMore: atAddress.length > page * limit + limit,
+      total: atAddress.length,
     });
   }
 
