@@ -49,6 +49,7 @@ const PDF_DIR = path.join(ROOT, "data", "pdfs");
 const OUT_DIR = path.join(ROOT, "data", "extracted");
 const CSV_DIR = path.join(ROOT, "data", "csv");
 const NAMES_DIR = path.join(ROOT, "data", "names");
+const EXTRA_DIR = path.join(ROOT, "data", "extra");
 const SHEET_DIR = path.join(ROOT, "data", "sheets");
 // Deliberately NOT under apps/web/public: files there are served by Next's
 // static handler before any auth code runs. They are streamed instead by
@@ -192,6 +193,20 @@ async function cmdSheets() {
 
 // ---------------------------------------------------------------- extraction
 
+/** data/extra/<partId>.json — electors printed on the roll but absent from the PDF. */
+interface ExtraFile {
+  source: string;
+  sectionLabel?: string;
+  electors: Array<{
+    serial: number;
+    name: string;
+    relationName: string;
+    relationType: Elector["relationType"];
+    age: number;
+    gender: Elector["gender"];
+  }>;
+}
+
 type NameMap = Record<string, [string | null, string | null]>;
 /**
  * Section headings (street / locality names) are printed in the same broken
@@ -210,6 +225,51 @@ async function loadNameMap(partId: string): Promise<NameMap> {
   } catch {
     return {};
   }
+}
+
+/**
+ * Electors the source PDF does not contain.
+ *
+ * The rolls are reissued as the ward is continuously updated, and a later
+ * पूरक can add people after the PDF in data/pdfs/ was downloaded. Those
+ * electors exist on the printed roll and must be findable, but nothing in the
+ * PDF can produce them, so they are kept here and folded in after extraction —
+ * otherwise the next re-run of this command would silently drop them again.
+ *
+ * A serial listed here never overwrites one the PDF produced: the PDF wins
+ * wherever both have something to say.
+ */
+async function loadExtras(partId: string, ward: string, partNo: string): Promise<Elector[]> {
+  let file: ExtraFile;
+  try {
+    file = JSON.parse(await readFile(path.join(EXTRA_DIR, `${partId}.json`), "utf8"));
+  } catch {
+    return [];
+  }
+  return file.electors.map((e) => ({
+    id: `${ward}_${partNo}_${e.serial}`,
+    serialNo: e.serial,
+    epicNo: null,
+    name: e.name,
+    relationName: e.relationName,
+    relationType: e.relationType,
+    houseNo: null,
+    age: e.age,
+    gender: e.gender,
+    sectionLabel: file.sectionLabel ?? null,
+    listType: "supplement",
+    isDeleted: false,
+    deletionReason: null,
+    photoPath: null,
+    pageImage: null,
+    pageNo: 0,
+    boxNo: 0,
+    raw: { source: file.source },
+    confidence: 0.8,
+    // Read off a photograph of the roll, not the roll's own text layer: worth
+    // re-checking whenever the newer PDF itself becomes available.
+    needsReview: true,
+  }));
 }
 
 async function extractOne(file: string): Promise<ExtractedPart> {
@@ -289,6 +349,13 @@ async function extractOne(file: string): Promise<ExtractedPart> {
     process.stdout.write(`  page ${pg.pageNo}/${doc.numPages}\r`);
   });
   process.stdout.write("\n");
+
+  const extras = await loadExtras(partId, ward, partNo);
+  const fresh = extras.filter((e) => !electors.has(e.serialNo));
+  for (const e of fresh) electors.set(e.serialNo, e);
+  if (extras.length) {
+    console.log(`  ${fresh.length} from data/extra/${partId}.json (${extras.length - fresh.length} already in the PDF)`);
+  }
 
   const list = [...electors.values()].sort((a, b) => a.serialNo - b.serialNo);
   const named = list.filter((e) => e.name).length;

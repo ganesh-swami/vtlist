@@ -51,6 +51,54 @@ export default function Page() {
   const [searched, setSearched] = useState(false);
   const [selected, setSelected] = useState<Result | null>(null);
 
+  // Print selection lives outside the search state on purpose: a new search
+  // replaces `results`, but a voter checked before that search must stay
+  // checked after it — this Set is never touched by runSearch().
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [printing, setPrinting] = useState(false);
+  const [printError, setPrintError] = useState<string | null>(null);
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function handlePrint() {
+    const ids = [...selectedIds];
+    if (!ids.length || printing) return;
+    setPrinting(true);
+    setPrintError(null);
+    try {
+      const res = await fetch("/api/print", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error ?? `प्रिंट विफल (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `voter-parchi-${ids.length}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setPrintError((err as Error).message);
+    } finally {
+      setPrinting(false);
+    }
+  }
+
   // Guards against an old request winning a race against a newer one — the
   // same job the debounce ticket used to do, just triggered by clicks now
   // instead of keystrokes.
@@ -156,6 +204,16 @@ export default function Page() {
           >
             {showFilters ? "फ़िल्टर छुपाएँ" : "और फ़िल्टर (filters)"}
           </button>
+          <button
+            onClick={() => setSelectMode((v) => !v)}
+            className={
+              selectMode
+                ? "rounded-md border border-primary bg-primary/10 px-2 py-0.5 text-primary"
+                : "text-muted-foreground hover:text-foreground underline-offset-4 hover:underline"
+            }
+          >
+            {selectMode ? "चयन बंद करें" : "प्रिंट के लिए चुनें"}
+          </button>
           {!loading && searched && (
             <span className="text-muted-foreground">{results.length} परिणाम</span>
           )}
@@ -215,11 +273,12 @@ export default function Page() {
         {results.map((r) => (
           <li
             key={r.id}
-            onClick={() => setSelected(r)}
+            onClick={() => (selectMode ? toggleSelect(r.id) : setSelected(r))}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                setSelected(r);
+                if (selectMode) toggleSelect(r.id);
+                else setSelected(r);
               }
             }}
             role="button"
@@ -227,6 +286,16 @@ export default function Page() {
             className="bg-card hover:border-primary/50 flex cursor-pointer gap-3 rounded-lg border p-3 shadow-sm transition-colors"
             style={r.is_deleted ? { opacity: 0.65 } : undefined}
           >
+            {selectMode && (
+              <input
+                type="checkbox"
+                checked={selectedIds.has(r.id)}
+                onChange={() => toggleSelect(r.id)}
+                onClick={(e) => e.stopPropagation()}
+                aria-label="प्रिंट के लिए चुनें"
+                className="accent-primary mt-1 h-4 w-4 shrink-0"
+              />
+            )}
             {/* Only part 3 has per-person crops; everyone else shows no
                 thumbnail here, but the click-through dialog always has an
                 image — the full page scan when there is no individual crop. */}
@@ -270,7 +339,10 @@ export default function Page() {
                 <span className="font-mono opacity-70">{r.id}</span>
                 <span className="opacity-70">
                   {" "}
-                  · वार्ड {r.ward} · भाग {r.part_no} · क्रम {r.serial_no} · पृष्ठ {r.page_no}
+                  · वार्ड {r.ward} · भाग{" "}
+                  <span className="text-foreground text-sm font-bold">{r.part_no}</span> · क्रम{" "}
+                  <span className="text-foreground text-sm font-bold">{r.serial_no}</span> · पृष्ठ{" "}
+                  {r.page_no}
                 </span>
               </div>
               {r.section_label && (
@@ -284,6 +356,26 @@ export default function Page() {
       </ul>
 
       {selected && <VoterModal voter={selected} onClose={() => setSelected(null)} />}
+
+      {selectedIds.size > 0 && (
+        <div className="bg-card fixed inset-x-0 bottom-4 z-20 mx-auto flex w-fit items-center gap-3 rounded-full border px-4 py-2 shadow-lg">
+          <span className="text-sm font-medium">{selectedIds.size} चयनित</span>
+          {printError && <span className="text-xs text-red-600 dark:text-red-400">{printError}</span>}
+          <button
+            onClick={() => setSelectedIds(new Set())}
+            className="text-muted-foreground hover:text-foreground text-sm underline-offset-4 hover:underline"
+          >
+            चयन हटाएँ
+          </button>
+          <button
+            onClick={() => void handlePrint()}
+            disabled={printing}
+            className="bg-primary text-primary-foreground rounded-full px-4 py-1.5 text-sm font-medium disabled:opacity-60"
+          >
+            {printing ? "बन रही है…" : "प्रिंट करें"}
+          </button>
+        </div>
+      )}
     </main>
   );
 }

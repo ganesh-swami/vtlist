@@ -73,8 +73,18 @@ const is = (s: string, list: readonly string[]) => list.includes(s.trim());
 // 751 carries a UP one). Hard-coding RJ nulled those EPICs and, because a
 // missing EPIC is what marks a supplement entry, quietly misfiled the row as पूरक.
 const EPIC = /^(?:[A-Z]{3}\d{7}|[A-Z]{2}\/\d{2}\/\d{3}\/\d{6})$/;
-/** A serial number, as printed in the roll's dedicated serial font. */
-const SERIAL = /^\d{1,5}$/;
+/**
+ * A serial number, as printed in the roll's dedicated serial font.
+ *
+ * The main roll prints these plain ("1148"), but the पूरक (supplement) pages
+ * print the same numbers comma-grouped ("1,149"). Matching only plain digits
+ * silently dropped every supplement page whose serials had crossed a thousand
+ * — parts 1 and 2 lost their entire परिवर्धन सूची that way, while parts 3 and 4
+ * survived only because their supplement serials never reach 1000.
+ */
+const SERIAL = /^\d{1,5}$|^\d{1,3}(?:,\d{3})+$/;
+/** A serial's numeric value, with the supplement pages' thousands comma removed. */
+const serialValue = (s: string) => Number(s.replace(/,/g, ""));
 /** The deletion marker printed immediately left of a struck-off serial. */
 const MARK = /^[ESR]$/;
 
@@ -260,7 +270,7 @@ export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
     let longest: Item[] = [];
     for (const item of ordered) {
       const prev = run.at(-1);
-      if (prev && Number(item.str) === Number(prev.str) + 1) run.push(item);
+      if (prev && serialValue(item.str) === serialValue(prev.str) + 1) run.push(item);
       else run = [item];
       if (run.length > longest.length) longest = [...run];
     }
@@ -298,7 +308,7 @@ export async function readPage(doc: any, pageNo: number): Promise<PageResult> {
     inside.forEach((i) => used.add(i));
 
     const box: RawBox = {
-      serialNo: Number(anchor.str),
+      serialNo: serialValue(anchor.str),
       epicNo: null,
       deletionMark: null,
       age: null,
