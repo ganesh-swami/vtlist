@@ -35,6 +35,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
+.env*
 
 # vercel
 .vercel
@@ -46,4 +47,3 @@ next-env.d.ts
 # voter roll source data & extraction output (personal data - never commit)
 /data/**
 !/data/pdfs/.gitkeep
-config.bat
